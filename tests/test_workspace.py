@@ -208,6 +208,62 @@ class TestDomains(unittest.TestCase):
                 [str(w.message) for w in seen],
             )
 
+    def test_env_strips_foreign_and_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            a = host.create("a")
+            b = host.create("b")
+            poison = {
+                "AGENTS_HOST_DIR": str(Path(tmp) / "other-host"),
+                "AGENTS_HOME": str(Path(tmp) / "other-home"),
+                "AGENTS_WORKSPACE": "b",
+                "AGENTS_WORKSPACE_ROOT": str(b.dir),
+                "AGENTS_WORKSPACE_DIR": str(b.dir / "other-work"),
+                "AGENTS_WORKSPACES_DIR": str(Path(tmp) / "other-ws"),
+                "AGENTS_DIR": str(b.dir),
+                "AGENTS_WORKDIR": str(b.dir / "wd"),
+                "AGENTS_PERSONA": "someone",
+                "AGENTS_MEMORY_PATH": str(b.memory),
+                "AGENTS_MEMORY_DIR": str(b.memory),
+                "AGENTS_RELAY_STATE": str(b.relay_state),
+                "AGENTS_RELAY_DIR": str(b.relay_state),
+                "AGENTS_IDENTITY_PATH": str(b.dir / "id.json"),
+                "AGENTS_KEYS_DIR": str(b.dir / "keys"),
+                "KEEP_ME": "yes",
+            }
+            child = a.env(poison)
+            self.assertEqual(child["KEEP_ME"], "yes")
+            self.assertEqual(child["AGENTS_HOST_DIR"], str(Path(tmp).resolve()))
+            self.assertEqual(child["AGENTS_WORKSPACE"], "a")
+            self.assertEqual(child["AGENTS_WORKDIR"], str(a.workdir))
+            self.assertNotIn("AGENTS_PERSONA", child)
+            for key in (
+                "AGENTS_HOME", "AGENTS_WORKSPACE_ROOT", "AGENTS_WORKSPACE_DIR",
+                "AGENTS_WORKSPACES_DIR", "AGENTS_DIR",
+            ):
+                self.assertNotIn(key, child, key)
+            # every resolver-owned value points inside workspace a (or the
+            # shared host), never inside workspace b
+            b_str = str(b.dir)
+            for key, value in child.items():
+                if key.startswith("AGENTS_"):
+                    self.assertFalse(
+                        str(value).startswith(b_str),
+                        f"{key} leaks into b: {value}",
+                    )
+            # new + alias names agree
+            self.assertEqual(child["AGENTS_MEMORY_DIR"], str(a.memory))
+            self.assertEqual(child["AGENTS_MEMORY_PATH"], str(a.memory))
+            self.assertEqual(child["AGENTS_RELAY_DIR"], str(a.relay_state))
+            self.assertEqual(child["AGENTS_RELAY_STATE"], str(a.relay_state))
+            self.assertEqual(child["AGENTS_KEYS_DIR"], str(host.keys))
+            self.assertEqual(child["AGENTS_USERS_FILE"], str(host.users_file()))
+            self.assertEqual(child["AGENTS_IDENTITY_PATH"], str(host.users_file()))
+            # persona + workdir params
+            child2 = a.env(poison, persona="ops", workdir="/tmp/wd2")
+            self.assertEqual(child2["AGENTS_PERSONA"], "ops")
+            self.assertEqual(child2["AGENTS_WORKDIR"], str(Path("/tmp/wd2").resolve()))
+
     def test_users_file_override_is_test_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             host = Host.open(tmp)

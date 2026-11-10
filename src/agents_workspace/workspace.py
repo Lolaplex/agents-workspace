@@ -86,6 +86,40 @@ DOMAIN_ENV = {
     "rules": "AGENTS_RULES_DIR",
 }
 
+# Every env var the resolver owns: ``Workspace.env()`` pops all of them from
+# the child env first, then sets this workspace's values (C12).
+_ENV_KEYS = frozenset(
+    (
+        ENV_HOST_DIR,
+        ENV_HOST_LEGACY,
+        ENV_WORKSPACE,
+        ENV_WORKDIR,
+        ENV_WORKDIR_LEGACY,
+        ENV_USERS_FILE,
+        ENV_USERS_FILE_LEGACY,
+        ENV_WORKSPACES_DIR,
+        ENV_ROOT,
+        ENV_WORKSPACE_ID_LEGACY,
+        "AGENTS_PERSONA",
+        "AGENTS_KEYS_DIR",
+        "AGENTS_MEMORY_DIR",
+        "AGENTS_RELAY_DIR",
+        "AGENTS_CONTENT_DIR",
+        "AGENTS_BROWSER_PROFILE",
+        "AGENTS_BROWSER_SESSION",
+        "AGENTS_KNOWN_DIDS_FILE",
+        "AGENTS_KNOWN_DIDS",
+        "AGENTS_MCP_CONFIG_FILE",
+        "AGENTS_MCP_CONFIG",
+        "AGENTS_MCP_CACHE_FILE",
+        "AGENTS_MCP_CACHE",
+        "AGENTS_SYNC_CONFIG_FILE",
+        "AGENTS_SYNC_CONFIG",
+        *REMOVED_ENV,
+        *DOMAIN_ENV.values(),
+    )
+)
+
 _ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -700,27 +734,59 @@ class Workspace:
             shutil.move(str(src), str(dst))
         return moves
 
-    def env(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    @staticmethod
+    def env_keys() -> tuple[str, ...]:
+        """Every env var the resolver owns (set or removed by ``env()``)."""
+        return tuple(sorted(_ENV_KEYS))
+
+    def env(
+        self,
+        base: Mapping[str, str] | None = None,
+        *,
+        persona: str = "",
+        workdir: str | Path | None = None,
+    ) -> dict[str, str]:
         """Process env for a turn or job inside this workspace.
 
-        C12 completes this: for now it exports the new level keys plus the
-        current domain set, and strips removed/foreign keys.
+        Sets every resolver-owned key to this workspace's paths (new names
+        plus one-release aliases) and strips removed keys, so no value from
+        a parent process or a foreign workspace can leak into the child.
         """
         out = dict(os.environ if base is None else base)
-        for key in REMOVED_ENV:
+        for key in _ENV_KEYS:
             out.pop(key, None)
+        workdir_p = _path(str(workdir)) if workdir else self.workdir
         out[ENV_HOST_DIR] = str(self.host.dir)
         out[ENV_WORKSPACE] = self.id
-        out[ENV_WORKDIR] = str(self.workdir)
-        out["AGENTS_WORKSPACE_ROOT"] = str(self.dir)  # deprecated bridge
-        out["AGENTS_MEMORY_PATH"] = str(self.memory)
-        out["AGENTS_TRACES_DIR"] = str(self.traces)
-        out["AGENTS_SCHEDULES_DIR"] = str(self.schedules)
-        out["AGENTS_ROUTINE_RUNS_DIR"] = str(self.routine_runs)
-        out["AGENTS_PERSONAS_DIR"] = str(self.personas)
-        out["AGENTS_SKILLS_DIR"] = str(self.skills)
-        out["AGENTS_MODULES_DIR"] = str(self.modules)
-        out["AGENTS_IDENTITY_PATH"] = str(self.identity)
+        out[ENV_WORKDIR] = str(workdir_p)
+        if persona:
+            out["AGENTS_PERSONA"] = persona
+        host = self.host
+        out["AGENTS_KEYS_DIR"] = str(host.keys)
+        pairs = (
+            ("AGENTS_MEMORY_DIR", "AGENTS_MEMORY_PATH", self.memory),
+            ("AGENTS_RELAY_DIR", "AGENTS_RELAY_STATE", self.relay_state),
+            ("AGENTS_RULES_DIR", None, self.rules),
+            ("AGENTS_SKILLS_DIR", None, self.skills),
+            ("AGENTS_MODULES_DIR", None, self.modules),
+            ("AGENTS_SCHEDULES_DIR", None, self.schedules),
+            ("AGENTS_TRACES_DIR", None, self.traces),
+            ("AGENTS_ROUTINE_RUNS_DIR", None, self.routine_runs),
+            ("AGENTS_PERSONAS_DIR", None, self.personas),
+            ("AGENTS_CONTENT_DIR", None, self.content),
+            ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION", host.browser),
+            (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY, self.identity),
+            ("AGENTS_KNOWN_DIDS_FILE", "AGENTS_KNOWN_DIDS",
+             host.keys / "known-dids.jsonl"),
+            ("AGENTS_MCP_CONFIG_FILE", "AGENTS_MCP_CONFIG", host.mcp_json),
+            ("AGENTS_MCP_CACHE_FILE", "AGENTS_MCP_CACHE",
+             host.cache / "mcp-tools-cache.json"),
+            ("AGENTS_SYNC_CONFIG_FILE", "AGENTS_SYNC_CONFIG", self.sync_config),
+        )
+        for new_name, alias, value in pairs:
+            out[new_name] = str(value)
+            if alias:
+                out[alias] = str(value)
         return out
 
     # --- reporting -----------------------------------------------------

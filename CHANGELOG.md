@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Domain env overrides (`AGENTS_MEMORY_PATH` & co.) are test/debug only: they
   apply only to the workspace chosen at CLI entry and emit a `UserWarning`;
   `Host.workspace()`, `list_workspaces()` and `open()` never read them.
+- `Workspace.env()` rewritten: sets `AGENTS_HOST_DIR`, `AGENTS_WORKSPACE`,
+  `AGENTS_WORKDIR`, optional `AGENTS_PERSONA`, `AGENTS_KEYS_DIR` and every
+  domain dir (new names plus one-release aliases); strips all removed keys
+  so parent values can never leak. New `Workspace.env_keys()` lists the
+  resolver-owned vars for stripping/comparing.
 - `Workspace` now carries `host: Host` and `dir` (was `root`).
 - `identity` resolves to `<host>/users.json` (`AGENTS_USERS_FILE`).
 
