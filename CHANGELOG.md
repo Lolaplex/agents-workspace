@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `calendar.json`, `content/`, `work/`, `browser/` (artifacts).
 - Reserved `parent_workspace` field (unused, for later job workspaces).
 
+### Added
+
+- CLI `create <id>`, `show [<id>]`, `env [<id>]` subcommands; `docs/NAMING.md`
+  holds the canonical naming/hierarchy spec.
+
 ### Changed
 
 - **BREAKING**: `AGENTS_WORKSPACE=<id>` now selects a workspace by id; the old
@@ -32,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain dir (new names plus one-release aliases); strips all removed keys
   so parent values can never leak. New `Workspace.env_keys()` lists the
   resolver-owned vars for stripping/comparing.
+- CLI reworked around the Host: `create <id>` replaces `init --root`
+  (deprecated alias, refuses `--root` outside `<host>/workspaces`), `list`
+  reads the host, `show`/`env` resolve by id or env selection.
+- README rewritten for the Host > Workspace model; `AGENTS_HOME` documented
+  only as a one-release deprecated alias.
 - `Workspace` now carries `host: Host` and `dir` (was `root`).
 - `identity` resolves to `<host>/users.json` (`AGENTS_USERS_FILE`).
 
