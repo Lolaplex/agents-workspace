@@ -134,6 +134,21 @@ def host_dir(env: Mapping[str, str] | None = None) -> Path:
     return default_host_dir()
 
 
+def _warn_domain_overrides(env: Mapping[str, str]) -> None:
+    """Domain overrides are test/debug only (D-domain-overrides)."""
+    names = [v for v in DOMAIN_ENV.values() if _clean(env, v)]
+    for extra in (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY):
+        if _clean(env, extra):
+            names.append(extra)
+    if names:
+        warnings.warn(
+            "domain env overrides are test/debug only and apply only to the "
+            "workspace chosen at CLI entry: " + ", ".join(sorted(names)),
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _read_meta(root: Path) -> dict:
     path = root / "workspace.json"
     if not path.is_file():
@@ -345,6 +360,7 @@ class Workspace:
         ad_hoc = _clean(env, ENV_ROOT)
         if ad_hoc:
             _deprecated(ENV_ROOT, f"{ENV_HOST_DIR} + {ENV_WORKSPACE}=<id>")
+            _warn_domain_overrides(env)
             return cls._ad_hoc(ad_hoc, env)
         legacy_home = _clean(env, ENV_HOST_LEGACY)
         if legacy_home and not _clean(env, ENV_HOST_DIR):
@@ -366,7 +382,9 @@ class Workspace:
             return cls._ad_hoc(str(host.dir), env)
         ws = host.select_workspace(env=env)
         workdir = cls._workdir_from_env(env, ws.dir)
-        return replace(ws, workdir=workdir, source_env=env, apply_overrides=True)
+        ws = replace(ws, workdir=workdir, source_env=env, apply_overrides=True)
+        _warn_domain_overrides(env)
+        return ws
 
     @staticmethod
     def _is_legacy_root(host_dir: Path) -> bool:
@@ -437,7 +455,7 @@ class Workspace:
             default_persona=str(meta.get("default_persona") or "default"),
             parent_workspace=str(meta.get("parent_workspace") or ""),
             source_env=env,
-            apply_overrides=True,
+            apply_overrides=False,
         )
 
     # --- deprecated constructors (compat, removed after one release) -----

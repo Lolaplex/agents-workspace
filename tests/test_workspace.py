@@ -170,6 +170,53 @@ class TestDomains(unittest.TestCase):
         ws = Host.open("/tmp/h").workspace("a")
         self.assertEqual(ws.claude, Path.home() / ".claude")
 
+    def test_process_override_never_reaches_other_workspaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            host.create("b")
+            import os as _os
+            from unittest.mock import patch as _patch
+
+            with _patch.dict(_os.environ, {"AGENTS_MEMORY_PATH": "/tmp/extmem"}):
+                self.assertEqual(
+                    host.workspace("b").memory,
+                    Path(tmp) / "workspaces" / "b" / "memory",
+                )
+                self.assertEqual(
+                    [str(ws.memory) for ws in host.list_workspaces()],
+                    [
+                        str(Path(tmp) / "workspaces" / "a" / "memory"),
+                        str(Path(tmp) / "workspaces" / "b" / "memory"),
+                    ],
+                )
+                # open() (deprecated ad-hoc) also ignores process overrides.
+                ws = Workspace.open(tmp + "/adhoc")
+                self.assertEqual(ws.memory, Path(tmp).resolve() / "adhoc" / "memory")
+
+    def test_override_warns_on_cli_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Host.open(tmp).create("a")
+            env = {"AGENTS_HOST_DIR": tmp, "AGENTS_WORKSPACE": "a",
+                   "AGENTS_MEMORY_PATH": "/tmp/extmem"}
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                Workspace.from_env(env)
+            self.assertTrue(
+                any(w.category is UserWarning and "AGENTS_MEMORY_PATH" in str(w.message)
+                    for w in seen),
+                [str(w.message) for w in seen],
+            )
+
+    def test_users_file_override_is_test_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            ws = host.workspace("a")
+            self.assertEqual(ws.identity, Path(tmp) / "users.json")
+            env = {"AGENTS_USERS_FILE": "/tmp/u.json"}
+            self.assertEqual(host.users_file(env), _p("/tmp/u.json"))
+
 
 class TestEnv(unittest.TestCase):
     def test_env_sets_level_keys(self):
