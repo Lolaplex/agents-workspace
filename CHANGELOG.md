@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING**: `AGENTS_WORKSPACE=<id>` now selects a workspace by id; the old
   `AGENTS_WORKSPACE_ROOT` path model is a deprecated ad-hoc bridge.
+- Domain env overrides (`AGENTS_MEMORY_PATH` & co.) are test/debug only: they
+  apply only to the workspace chosen at CLI entry and emit a `UserWarning`;
+  `Host.workspace()`, `list_workspaces()` and `open()` never read them.
 - `Workspace` now carries `host: Host` and `dir` (was `root`).
 - `identity` resolves to `<host>/users.json` (`AGENTS_USERS_FILE`).
 
