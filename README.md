@@ -1,63 +1,87 @@
 # agents-workspace
 
-One root for every agents domain.
-
-`AGENTS_HOME` grew from a memory override into a de-facto workspace root, but six
-domains never followed it. This package makes the root explicit and resolves
-every domain from it in one place.
+Host > Workspace > Persona > Session path resolver for the Lolaplex suite.
+See `docs/NAMING.md` for the canonical spec.
 
 ```python
-from agents_workspace import Workspace
+from agents_workspace import Host, Workspace
 
-ws = Workspace.from_env()
-ws.root          # AGENTS_WORKSPACE_ROOT, else AGENTS_HOME, else ~/.agents
-ws.workdir       # AGENTS_WORKDIR, else AGENTS_WORKSPACE_DIR, else root/workspace
-ws.memory        # AGENTS_MEMORY_PATH, else root/memory
-ws.traces        # AGENTS_TRACES_DIR, else root/traces
-ws.schedules     # AGENTS_SCHEDULES_DIR, else root/schedules
-ws.personas      # AGENTS_PERSONAS_DIR, else root/personas
+host = Host.from_env()          # AGENTS_HOST_DIR, else ~/.agents
+ws = host.workspace("a")        # <host>/workspaces/a — never reads env overrides
+ws = Workspace.from_env()       # CLI entry: AGENTS_WORKSPACE=<id> selects the ws
+ws.memory                       # <ws>/memory
+ws.traces                       # <ws>/traces
+ws.env()                        # child env for a turn/job inside this workspace
 ```
+
+The Host holds infrastructure only: `keys/`, `secrets.json`, `run/`, `cache/`,
+`logs/`, `clients/`, `agents.json`, `mcp.json`, `host_paths.json`, `users.json`,
+browser profile. Every Workspace lives at `<host>/workspaces/<id>` and owns the
+data domains.
 
 ## Domains
 
-| Domain | Env override | Default |
+| Domain | Env override (test/debug only) | Default |
 |---|---|---|
-| `memory` | `AGENTS_MEMORY_PATH` | `root/memory` |
-| `rules` | — | `root/rules` |
-| `skills` | `AGENTS_SKILLS_DIR` | `root/skills` |
-| `modules` | `AGENTS_MODULES_DIR` | `root/modules` |
-| `schedules` | `AGENTS_SCHEDULES_DIR` | `root/schedules` |
-| `traces` | `AGENTS_TRACES_DIR` | `root/traces` |
-| `routine-runs` | `AGENTS_ROUTINE_RUNS_DIR` | `root/routine-runs` |
-| `relay` | `AGENTS_RELAY_STATE` | `root/relay` |
-| `personas` | `AGENTS_PERSONAS_DIR` | `root/personas` |
-| `claude` | — | `root/claude` when the root is explicit, else `~/.claude` |
-| `identity` | `AGENTS_IDENTITY_PATH` | `root/identity.json` |
-| `config` | — | `root/config.json` |
-| `secrets` | — | `root/secrets.json` |
-| `store` | — | `root/store.db` |
+| `memory` | `AGENTS_MEMORY_DIR` (alias `AGENTS_MEMORY_PATH`) | `<ws>/memory` |
+| `rules` | `AGENTS_RULES_DIR` | `<ws>/rules` |
+| `skills` | `AGENTS_SKILLS_DIR` | `<ws>/skills` |
+| `modules` | `AGENTS_MODULES_DIR` | `<ws>/modules` |
+| `schedules` | `AGENTS_SCHEDULES_DIR` | `<ws>/schedules` |
+| `traces` | `AGENTS_TRACES_DIR` | `<ws>/traces` |
+| `routine-runs` | `AGENTS_ROUTINE_RUNS_DIR` | `<ws>/routine-runs` |
+| `relay` | `AGENTS_RELAY_DIR` (alias `AGENTS_RELAY_STATE`) | `<ws>/relay` |
+| `personas` | `AGENTS_PERSONAS_DIR` | `<ws>/personas` |
+| `content` | `AGENTS_CONTENT_DIR` | `<ws>/content` |
+| `work` | — | `<ws>/work` |
+| `browser` | — | `<ws>/browser` (artifacts; profile lives on the Host) |
+| `members` | — | `<ws>/members.json` |
+| `config` | — | `<ws>/config.json` |
+| `secrets` | — | `<ws>/secrets.json` (overrides host `secrets.json`) |
+| `store` | — | `<ws>/store.db` |
+| `sync_config` | `AGENTS_SYNC_CONFIG_FILE` (alias `AGENTS_SYNC_CONFIG`) | `<ws>/sync_config.json` |
+| `mcp` | `AGENTS_MCP_CONFIG_FILE` (alias `AGENTS_MCP_CONFIG`) | `<ws>/mcp.json` (overlay of host `mcp.json`) |
+| `calendar` | — | `<ws>/calendar.json` |
 
-Precedence is always: explicit env, then the workspace default, then the global
-fallback. `AGENTS_HOME` and `AGENTS_WORKSPACE_DIR` stay readable as legacy
-aliases; new code writes `AGENTS_WORKSPACE_ROOT` and `AGENTS_WORKDIR`.
+`identity` resolves to the host users file `<host>/users.json`
+(`AGENTS_USERS_FILE`, alias `AGENTS_IDENTITY_PATH`).
 
-## Registry
+Domain overrides are **test/debug only**: they apply to the workspace chosen
+at CLI entry (`Workspace.from_env`) and emit a `UserWarning`; `Host.workspace()`
+and `list_workspaces()` never read them.
 
-Additional workspaces live under `AGENTS_WORKSPACES_DIR` (default `~/.agents-workspaces`). `Workspace.list_all()` returns the default workspace plus every child with a `workspace.json`. `Workspace.resolve(ref)` matches an id, label, directory name, or path. `Workspace.create(label)` mints a slug directory and initializes it.
+Selection without an id: the only existing workspace is used; if several
+exist, `Workspace.from_env()` errors (pass `AGENTS_WORKSPACE=<id>` or
+`--workspace`). First start creates a normal workspace `default` with persona
+`default` — both renamable, no special role.
+
+## Migration notes (one release)
+
+Deprecated aliases still read, with warnings:
+
+- `AGENTS_HOME` → `AGENTS_HOST_DIR` (a dir without `workspaces/` but with
+  legacy domain dirs still resolves as the workspace itself until `migrate`)
+- `AGENTS_WORKSPACE_DIR` → `AGENTS_WORKDIR`
+- `AGENTS_IDENTITY_PATH` → `AGENTS_USERS_FILE`
+- `AGENTS_WORKSPACES_DIR` → `<host>/workspaces`
+- `AGENTS_WORKSPACE_ROOT` → ad-hoc workspace dir (no host metadata)
 
 ## CLI
 
 ```bash
+agents-workspace create a --label personal   # <host>/workspaces/a + persona default
+agents-workspace list
+agents-workspace show a --json
+agents-workspace env a                       # KEY=VALUE lines for child envs
 agents-workspace info
 agents-workspace path traces
-agents-workspace init --label personal
-agents-workspace list
-agents-workspace create --label personal
 agents-workspace migrate --dry-run
 ```
 
-`migrate` moves legacy `~/.agents/<domain>` directories into the workspace when
-the workspace root is not `~/.agents` and the target does not exist yet.
+`init` remains for one release as a deprecated alias that refuses `--root`
+outside `<host>/workspaces`. `migrate` moves legacy host-level domain dirs
+(`<host>/memory`, `<host>/traces`, …) into the selected workspace when the
+target does not exist yet.
 
 ## What this is not
 
