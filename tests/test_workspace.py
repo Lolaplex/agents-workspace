@@ -1,199 +1,245 @@
-"""Workspace resolution tests."""
+"""Host/Workspace resolver tests."""
 
 from __future__ import annotations
 
 import os
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
-from unittest.mock import patch
 
-from agents_workspace import DIR_DOMAINS, Workspace
+from agents_workspace import Host, Workspace, host_dir
 
 
 def _p(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
-class TestRoot(unittest.TestCase):
-    def test_default_root_is_legacy(self):
-        with patch("agents_workspace.workspace.legacy_root", return_value=_p("/tmp/legacy")):
-            ws = Workspace.from_env({})
-        self.assertEqual(ws.root, _p("/tmp/legacy"))
-        self.assertFalse(ws.explicit_root)
+def _host_dir(path: str) -> dict:
+    return {"AGENTS_HOST_DIR": path}
 
-    def test_new_root_wins_over_legacy(self):
-        ws = Workspace.from_env(
-            {"AGENTS_WORKSPACE_ROOT": "/tmp/ws", "AGENTS_HOME": "/tmp/home"}
+
+class TestHostSelection(unittest.TestCase):
+    def test_host_dir_env_wins(self):
+        self.assertEqual(host_dir({"AGENTS_HOST_DIR": "/tmp/h"}), _p("/tmp/h"))
+
+    def test_host_home_alias_warns(self):
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            got = host_dir({"AGENTS_HOME": "/tmp/h"})
+        self.assertEqual(got, _p("/tmp/h"))
+        self.assertTrue(
+            any(w.category is DeprecationWarning for w in seen), "no DeprecationWarning"
         )
-        self.assertEqual(ws.root, _p("/tmp/ws"))
-        self.assertTrue(ws.explicit_root)
 
-    def test_legacy_root_is_read(self):
-        ws = Workspace.from_env({"AGENTS_HOME": "/tmp/home"})
-        self.assertEqual(ws.root, _p("/tmp/home"))
-        self.assertTrue(ws.explicit_root)
+    def test_host_dir_beats_home(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            got = host_dir({"AGENTS_HOST_DIR": "/tmp/new", "AGENTS_HOME": "/tmp/old"})
+        self.assertEqual(got, _p("/tmp/new"))
 
-    def test_workdir_defaults_to_root_workspace(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        self.assertEqual(ws.workdir, _p("/tmp/ws/workspace"))
+    def test_host_default(self):
+        self.assertEqual(host_dir({}), Path.home() / ".agents")
 
-    def test_workdir_new_env_wins(self):
-        ws = Workspace.from_env(
-            {
-                "AGENTS_WORKSPACE_ROOT": "/tmp/ws",
-                "AGENTS_WORKDIR": "/tmp/new",
-                "AGENTS_WORKSPACE_DIR": "/tmp/old",
-            }
-        )
-        self.assertEqual(ws.workdir, _p("/tmp/new"))
 
-    def test_workdir_legacy_env_is_read(self):
-        ws = Workspace.from_env(
-            {"AGENTS_WORKSPACE_ROOT": "/tmp/ws", "AGENTS_WORKSPACE_DIR": "/tmp/old"}
-        )
+class TestWorkspaceResolution(unittest.TestCase):
+    def test_workspace_dir_under_host(self):
+        host = Host.open("/tmp/h")
+        self.assertEqual(host.workspace("a").dir, _p("/tmp/h/workspaces/a"))
+
+    def test_workspace_id_validation(self):
+        host = Host.open("/tmp/h")
+        for bad in ("../x", "a/b", "a b", "", ".", "..", "x\\y"):
+            with self.assertRaises(ValueError, msg=bad):
+                host.workspace(bad)
+
+    def test_first_start_creates_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.select_workspace()
+            self.assertEqual(ws.id, "default")
+            self.assertTrue((Path(tmp) / "workspaces" / "default" / "workspace.json").is_file())
+            self.assertTrue((Path(tmp) / "workspaces" / "default" / "personas" / "default" / "persona.json").is_file())
+
+    def test_single_workspace_used_when_no_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("solo")
+            ws = host.select_workspace()
+            self.assertEqual(ws.id, "solo")
+
+    def test_several_workspaces_error_without_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            host.create("b")
+            with self.assertRaises(ValueError):
+                host.select_workspace()
+            self.assertEqual(host.select_workspace("a").dir, Path(tmp) / "workspaces" / "a")
+
+    def test_unknown_id_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            with self.assertRaises(ValueError):
+                host.select_workspace("nope")
+
+    def test_env_selects_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            ws = Workspace.from_env({"AGENTS_HOST_DIR": tmp, "AGENTS_WORKSPACE": "a"})
+            self.assertEqual(ws.id, "a")
+            self.assertEqual(ws.dir, Path(tmp) / "workspaces" / "a")
+
+
+class TestAdHocCompat(unittest.TestCase):
+    def test_workspace_root_bridge(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
+        self.assertEqual(ws.dir, _p("/tmp/ws"))
+        self.assertEqual(ws.workdir, _p("/tmp/ws/work"))
+
+    def test_workdir_env(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ws = Workspace.from_env(
+                {"AGENTS_WORKSPACE_ROOT": "/tmp/ws", "AGENTS_WORKDIR": "/tmp/cwd"}
+            )
+        self.assertEqual(ws.workdir, _p("/tmp/cwd"))
+
+    def test_workdir_legacy_alias(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ws = Workspace.from_env(
+                {"AGENTS_WORKSPACE_ROOT": "/tmp/ws", "AGENTS_WORKSPACE_DIR": "/tmp/old"}
+            )
         self.assertEqual(ws.workdir, _p("/tmp/old"))
 
 
 class TestDomains(unittest.TestCase):
-    def test_defaults_follow_root(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        for name in DIR_DOMAINS:
-            self.assertEqual(ws.domain(name), _p(f"/tmp/ws/{name}"), name)
+    def _ws(self, tmp: str) -> Workspace:
+        return Host.open(tmp).workspace("a")
 
-    def test_domain_env_override(self):
-        ws = Workspace.from_env(
-            {
-                "AGENTS_WORKSPACE_ROOT": "/tmp/ws",
-                "AGENTS_TRACES_DIR": "/tmp/traces",
-                "AGENTS_MEMORY_PATH": "/tmp/memory",
-                "AGENTS_SCHEDULES_DIR": "/tmp/schedules",
-                "AGENTS_RELAY_STATE": "/tmp/relay",
-                "AGENTS_PERSONAS_DIR": "/tmp/personas",
+    def test_defaults_follow_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            for name in ("memory", "traces", "skills", "modules", "schedules",
+                         "routine-runs", "relay", "personas", "rules"):
+                self.assertEqual(ws.domain(name), Path(tmp) / "workspaces" / "a" / name, name)
+
+    def test_file_domains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            base = Path(tmp) / "workspaces" / "a"
+            self.assertEqual(ws.members, base / "members.json")
+            self.assertEqual(ws.sync_config, base / "sync_config.json")
+            self.assertEqual(ws.calendar, base / "calendar.json")
+            self.assertEqual(ws.workspace_file, base / "workspace.json")
+
+    def test_host_infra_paths(self):
+        host = Host.open("/tmp/h")
+        self.assertEqual(host.keys, _p("/tmp/h/keys"))
+        self.assertEqual(host.run, _p("/tmp/h/run"))
+        self.assertEqual(host.cache, _p("/tmp/h/cache"))
+        self.assertEqual(host.clients, _p("/tmp/h/clients"))
+        self.assertEqual(host.users_file(), _p("/tmp/h/users.json"))
+
+    def test_identity_on_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            self.assertEqual(ws.identity, Path(tmp) / "users.json")
+
+    def test_override_only_on_cli_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            env = _host_dir(tmp) | {
+                "AGENTS_WORKSPACE": "a",
+                "AGENTS_MEMORY_PATH": "/tmp/extmem",
             }
-        )
-        self.assertEqual(ws.traces, _p("/tmp/traces"))
-        self.assertEqual(ws.memory, _p("/tmp/memory"))
-        self.assertEqual(ws.schedules, _p("/tmp/schedules"))
-        self.assertEqual(ws.relay_state, _p("/tmp/relay"))
-        self.assertEqual(ws.personas, _p("/tmp/personas"))
+            ws = Workspace.from_env(env)
+            self.assertEqual(ws.memory, _p("/tmp/extmem"))
+            # The same workspace via Host never sees the process override.
+            self.assertEqual(
+                host.workspace("a").memory, Path(tmp) / "workspaces" / "a" / "memory"
+            )
 
-    def test_identity_override(self):
-        ws = Workspace.from_env(
-            {"AGENTS_WORKSPACE_ROOT": "/tmp/ws", "AGENTS_IDENTITY_PATH": "/tmp/id.json"}
-        )
-        self.assertEqual(ws.identity, _p("/tmp/id.json"))
-
-    def test_identity_default(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        self.assertEqual(ws.identity, _p("/tmp/ws/identity.json"))
-
-    def test_claude_default_without_explicit_root(self):
-        with patch("agents_workspace.workspace.legacy_root", return_value=_p("/tmp/legacy")):
-            ws = Workspace.from_env({})
+    def test_claude_is_home(self):
+        ws = Host.open("/tmp/h").workspace("a")
         self.assertEqual(ws.claude, Path.home() / ".claude")
 
-    def test_claude_follows_explicit_root(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        self.assertEqual(ws.claude, _p("/tmp/ws/claude"))
 
-    def test_unknown_domain_raises(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        with self.assertRaises(KeyError):
-            ws.domain("nope")
-
-
-class TestRegistry(unittest.TestCase):
-    def test_env_sets_every_domain(self):
-        ws = Workspace.from_env({"AGENTS_WORKSPACE_ROOT": "/tmp/ws"})
-        env = ws.env({})
-        self.assertEqual(env["AGENTS_WORKSPACE_ROOT"], str(ws.root))
-        self.assertEqual(env["AGENTS_MEMORY_PATH"], str(ws.memory))
-        self.assertEqual(env["AGENTS_TRACES_DIR"], str(ws.traces))
-        self.assertEqual(env["AGENTS_PERSONAS_DIR"], str(ws.personas))
-
-    def test_create_and_list(self):
+class TestEnv(unittest.TestCase):
+    def test_env_sets_level_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"AGENTS_WORKSPACES_DIR": tmp}, clear=False):
-                ws = Workspace.create("Personal Notes")
-                self.assertTrue((ws.root / "workspace.json").is_file())
-                self.assertEqual(ws.label, "Personal Notes")
-                rows = Workspace.list_all()
-                self.assertTrue(any(row.root == ws.root for row in rows))
+            host = Host.open(tmp)
+            ws = host.create("a")
+            env = ws.env({})
+            self.assertEqual(env["AGENTS_HOST_DIR"], str(host.dir))
+            self.assertEqual(env["AGENTS_WORKSPACE"], "a")
+            self.assertEqual(env["AGENTS_WORKDIR"], str(ws.workdir))
 
-    def test_resolve_by_label_and_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"AGENTS_WORKSPACES_DIR": tmp}, clear=False):
-                ws = Workspace.create("demo")
-                self.assertEqual(Workspace.resolve("demo").root, ws.root)
-                self.assertEqual(Workspace.resolve(str(ws.root)).root, ws.root)
-                self.assertIsNone(Workspace.resolve("nope"))
+    def test_env_strips_removed(self):
+        ws = Host.open("/tmp/h").workspace("a")
+        env = ws.env({"AGENTS_DIR": "/tmp/x"})
+        self.assertNotIn("AGENTS_DIR", env)
 
 
 class TestLifecycle(unittest.TestCase):
-    def test_ensure_creates_every_dir_domain(self):
+    def test_ensure_creates_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ws = Workspace.open(tmp).ensure()
-            for name in DIR_DOMAINS:
+            ws = Host.open(tmp).create("a")
+            for name in ("memory", "traces", "personas", "work"):
                 self.assertTrue(ws.domain(name).is_dir(), name)
 
     def test_init_writes_and_reloads_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ws = Workspace.open(tmp).init(label="personal")
-            self.assertTrue(ws.workspace_file.is_file())
-            self.assertTrue(ws.id.startswith("ws_"))
-            again = Workspace.open(tmp)
-            self.assertEqual(again.id, ws.id)
+            host = Host.open(tmp)
+            ws = host.create("a", label="personal")
+            again = host.workspace("a")
+            self.assertEqual(again.id, "a")
             self.assertEqual(again.label, "personal")
             self.assertEqual(again.default_persona, "default")
 
-    def test_init_keeps_existing_id(self):
+    def test_create_persona(self):
         with tempfile.TemporaryDirectory() as tmp:
-            first = Workspace.open(tmp).init(label="one")
-            second = Workspace.open(tmp).init(label="two")
-            self.assertEqual(first.id, second.id)
-            self.assertEqual(second.label, "two")
+            host = Host.open(tmp)
+            host.create("a", persona="chief")
+            ws = host.workspace("a")
+            self.assertEqual(ws.default_persona, "chief")
+            self.assertTrue((ws.personas / "chief" / "persona.json").is_file())
 
-    def test_migrate_moves_legacy_domains(self):
+    def test_migrate_moves_host_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
-            legacy = Path(tmp) / "legacy"
-            (legacy / "memory").mkdir(parents=True)
-            (legacy / "memory" / "facts.md").write_text("x", encoding="utf-8")
-            target = Path(tmp) / "ws"
-            with patch("agents_workspace.workspace.legacy_root", return_value=legacy.resolve()):
-                moves = Workspace.open(target).migrate()
+            host = Host.open(tmp)
+            (host.dir / "memory").mkdir(parents=True)
+            (host.dir / "memory" / "facts.md").write_text("x", encoding="utf-8")
+            ws = host.workspace("b")  # not created: no domain dirs yet
+            moves = ws.migrate()
             self.assertEqual(len(moves), 1)
-            self.assertTrue((target / "memory" / "facts.md").is_file())
-            self.assertFalse((legacy / "memory").exists())
+            self.assertTrue((ws.dir / "memory" / "facts.md").is_file())
 
-    def test_migrate_dry_run_keeps_source(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            legacy = Path(tmp) / "legacy"
-            (legacy / "traces").mkdir(parents=True)
-            target = Path(tmp) / "ws"
-            with patch("agents_workspace.workspace.legacy_root", return_value=legacy.resolve()):
-                moves = Workspace.open(target).migrate(dry_run=True)
-            self.assertEqual(len(moves), 1)
-            self.assertTrue((legacy / "traces").is_dir())
-            self.assertFalse((target / "traces").exists())
 
-    def test_migrate_skips_existing_target(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            legacy = Path(tmp) / "legacy"
-            (legacy / "memory").mkdir(parents=True)
-            target = Path(tmp) / "ws"
-            (target / "memory").mkdir(parents=True)
-            with patch("agents_workspace.workspace.legacy_root", return_value=legacy.resolve()):
-                moves = Workspace.open(target).migrate()
-            self.assertEqual(moves, [])
+class TestDeprecatedSurface(unittest.TestCase):
+    def test_root_property(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ws = Host.open("/tmp/h").workspace("a")
+            self.assertEqual(ws.root, ws.dir)
 
-    def test_migrate_noop_at_legacy_root(self):
+    def test_resolve_by_id_and_label(self):
         with tempfile.TemporaryDirectory() as tmp:
-            legacy = Path(tmp) / "legacy"
-            (legacy / "memory").mkdir(parents=True)
-            with patch("agents_workspace.workspace.legacy_root", return_value=legacy.resolve()):
-                moves = Workspace.open(legacy).migrate()
-            self.assertEqual(moves, [])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                host = Host.open(tmp)
+                host.create("demo", label="Demo WS")
+                ws = Workspace.resolve("demo", env={"AGENTS_HOST_DIR": tmp})
+                self.assertIsNotNone(ws)
+                self.assertEqual(ws.id, "demo")
+                self.assertEqual(Workspace.resolve("Demo WS", env={"AGENTS_HOST_DIR": tmp}).id, "demo")
+                self.assertIsNone(Workspace.resolve("nope", env={"AGENTS_HOST_DIR": tmp}))
 
 
 if __name__ == "__main__":

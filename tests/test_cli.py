@@ -44,12 +44,13 @@ class TestCli(unittest.TestCase):
             self.assertTrue((Path(tmp) / "workspace.json").is_file())
 
     def test_migrate_reports_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as legacy:
-            with patch("agents_workspace.workspace.legacy_root", return_value=Path(legacy).resolve()):
-                code, out = _run(
-                    ["migrate"],
-                    {"AGENTS_WORKSPACE_ROOT": tmp},
-                )
+        with tempfile.TemporaryDirectory() as tmp:
+            from agents_workspace import Host
+
+            Host.open(tmp).create("a")
+            code, out = _run(
+                ["migrate"], {"AGENTS_HOST_DIR": tmp, "AGENTS_WORKSPACE": "a"}
+            )
             self.assertEqual(code, 0)
             self.assertIn("nothing to migrate", out)
 
