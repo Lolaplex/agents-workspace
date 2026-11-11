@@ -126,15 +126,19 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
-    ws = Workspace.from_env()
-    moves = ws.migrate(dry_run=args.dry_run)
-    if not moves:
-        print("nothing to migrate")
+    from .migrate import rollback, run_cli
+
+    host = Host.from_env()
+    if args.rollback:
+        restored = rollback(Path(args.rollback))
+        print(f"restored {restored} entries")
         return 0
-    verb = "would move" if args.dry_run else "moved"
-    for src, dst in moves:
-        print(f"{verb} {src} -> {dst}")
-    return 0
+    return run_cli(
+        host,
+        ws_id=args.workspace or "default",
+        dry_run=args.dry_run,
+        yes=args.yes,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,8 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--persona", default="")
     init.set_defaults(func=cmd_init)
 
-    migrate = sub.add_parser("migrate", help="Move legacy host-level domains into a workspace.")
+    migrate = sub.add_parser("migrate", help="Migrate a legacy ~/.agents layout to Host/Workspace.")
     migrate.add_argument("--dry-run", action="store_true")
+    migrate.add_argument("--yes", action="store_true", help="Apply without asking.")
+    migrate.add_argument("--workspace", default="default",
+                         help="Workspace id receiving legacy data (default: default).")
+    migrate.add_argument("--rollback", default="", metavar="LOG",
+                         help="Reverse a previous run using its JSON log.")
     migrate.set_defaults(func=cmd_migrate)
 
     return parser
