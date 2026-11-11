@@ -347,3 +347,37 @@ class TestDeprecatedSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDomainAliases(unittest.TestCase):
+    def test_memory_dir_new_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(dir=Path(tmp) / "host")
+            host.create("w1")
+            env = {"AGENTS_HOST_DIR": str(host.dir), "AGENTS_WORKSPACE": "w1",
+                   "AGENTS_MEMORY_DIR": tmp + "/new", "AGENTS_MEMORY_PATH": tmp + "/old"}
+            ws = Workspace.from_env(env)
+            self.assertEqual(ws.memory, Path(tmp + "/new").resolve())
+
+    def test_memory_path_alias_warns(self):
+        import warnings
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(dir=Path(tmp) / "host")
+            host.create("w1")
+            env = {"AGENTS_HOST_DIR": str(host.dir), "AGENTS_WORKSPACE": "w1",
+                   "AGENTS_MEMORY_PATH": tmp + "/old"}
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                ws = Workspace.from_env(env)
+                self.assertEqual(ws.memory, Path(tmp + "/old").resolve())
+            self.assertTrue(any("AGENTS_MEMORY_PATH is deprecated" in str(w.message) for w in seen))
+
+    def test_read_alias_helper(self):
+        import warnings
+        from agents_workspace.compat import read_alias
+        self.assertEqual(read_alias({"NEW": "a", "OLD": "b"}, "NEW", "OLD"), "a")
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            self.assertEqual(read_alias({"OLD": "b"}, "NEW", "OLD"), "b")
+        self.assertTrue(any("deprecated" in str(w.message) for w in seen))
+        self.assertEqual(read_alias({}, "NEW", "OLD"), "")
