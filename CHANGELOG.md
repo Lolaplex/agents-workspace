@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `docs/PERSONAS.md`: P2 persona rules home — equal personas (no
+  hierarchy), first persona `default` per workspace, role as
+  description text, inbox + explicit task ownership for handoffs,
+  session key `ws+user+persona`, API surface. Extends `docs/NAMING.md`
+  without contradicting the closed P1 spec.
 - `agents_workspace.inbox`: per-persona task inbox + explicit handoff
   ownership. A task is one JSON file in exactly one persona's
   `<ws>/personas/<p>/inbox/`; `handoff()` moves the file to the target
