@@ -1,7 +1,9 @@
 # agents-workspace
 
 Host > Workspace > Persona > Session path resolver for the Lolaplex suite.
-See `docs/NAMING.md` for the canonical spec.
+See `docs/NAMING.md` for the canonical P1 spec and `docs/PERSONAS.md`
+for the P2 persona rules (equal personas, first `default`, inbox
+handoffs, session key).
 
 ```python
 from agents_workspace import Host, Workspace
