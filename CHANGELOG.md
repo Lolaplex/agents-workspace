@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `agents_workspace.inbox`: per-persona task inbox + explicit handoff
+  ownership. A task is one JSON file in exactly one persona's
+  `<ws>/personas/<p>/inbox/`; `handoff()` moves the file to the target
+  persona (owner = location, no hierarchy, no default-persona
+  privilege) and appends a `handoff` event. `create_task`,
+  `list_inbox`, `find_task`, `task_owner` included; ids validated.
 - `agents-workspace migrate`: explicit one-shot host migration from a legacy
   `~/.agents` layout to `Host/Workspace`. Pure planner, `--dry-run`, `--yes`,
   `--rollback <log>`; lock at `<host>/run/migrate.lock`, JSON op-log under
