@@ -75,15 +75,21 @@ ALL_DOMAINS = DIR_DOMAINS + ("claude",) + FILE_DOMAINS + ("identity",)
 # Domain overrides are test/debug only: they apply to the workspace chosen at
 # CLI entry (Workspace.from_env) and are ignored everywhere else (C11).
 DOMAIN_ENV = {
-    "memory": "AGENTS_MEMORY_PATH",  # -> AGENTS_MEMORY_DIR in C70
+    "memory": "AGENTS_MEMORY_DIR",
     "skills": "AGENTS_SKILLS_DIR",
     "modules": "AGENTS_MODULES_DIR",
     "schedules": "AGENTS_SCHEDULES_DIR",
     "traces": "AGENTS_TRACES_DIR",
     "routine-runs": "AGENTS_ROUTINE_RUNS_DIR",
-    "relay": "AGENTS_RELAY_STATE",  # -> AGENTS_RELAY_DIR in C70/C71
+    "relay": "AGENTS_RELAY_DIR",
     "personas": "AGENTS_PERSONAS_DIR",
     "rules": "AGENTS_RULES_DIR",
+}
+
+# Deprecated aliases for DOMAIN_ENV names (one release, then removed).
+DOMAIN_ENV_ALIASES = {
+    "memory": "AGENTS_MEMORY_PATH",
+    "relay": "AGENTS_RELAY_STATE",
 }
 
 # Every env var the resolver owns: ``Workspace.env()`` pops all of them from
@@ -117,6 +123,7 @@ _ENV_KEYS = frozenset(
         "AGENTS_SYNC_CONFIG",
         *REMOVED_ENV,
         *DOMAIN_ENV.values(),
+        *DOMAIN_ENV_ALIASES.values(),
     )
 )
 
@@ -171,6 +178,7 @@ def host_dir(env: Mapping[str, str] | None = None) -> Path:
 def _warn_domain_overrides(env: Mapping[str, str]) -> None:
     """Domain overrides are test/debug only (D-domain-overrides)."""
     names = [v for v in DOMAIN_ENV.values() if _clean(env, v)]
+    names += [a for a in DOMAIN_ENV_ALIASES.values() if _clean(env, a)]
     for extra in (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY):
         if _clean(env, extra):
             names.append(extra)
@@ -576,6 +584,12 @@ class Workspace:
                 raw = _clean(self.source_env, env_name)
                 if raw:
                     return _path(raw)
+                alias = DOMAIN_ENV_ALIASES.get(name)
+                if alias:
+                    raw = _clean(self.source_env, alias)
+                    if raw:
+                        _deprecated(alias, env_name)
+                        return _path(raw)
         return self.dir / name
 
     @property

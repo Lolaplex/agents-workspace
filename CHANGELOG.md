@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `agents_workspace.compat.read_alias(env, new, old)`: shared deprecated-alias reader (new wins, old warns, one release).
+- `DOMAIN_ENV_ALIASES`: `AGENTS_MEMORY_PATH` -> `AGENTS_MEMORY_DIR`, `AGENTS_RELAY_STATE` -> `AGENTS_RELAY_DIR` (deprecated aliases, one release). `AGENTS_RULES_DIR` already canonical.
 
 - `Host` type: `AGENTS_HOST_DIR` (default `~/.agents`) holds infra only
   (`keys/`, `secrets.json`, `run/`, `cache/`, `logs/`, `clients/`,
