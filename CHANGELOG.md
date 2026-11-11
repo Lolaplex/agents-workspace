@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `agents-workspace migrate`: explicit one-shot host migration from a legacy
+  `~/.agents` layout to `Host/Workspace`. Pure planner, `--dry-run`, `--yes`,
+  `--rollback <log>`; lock at `<host>/run/migrate.lock`, JSON op-log under
+  `<host>/logs/migrate-<ts>.json`, conflict preflight aborts before any move,
+  idempotent (`already migrated`), byte-identical rollback. Moves workspace
+  domains and files into `workspaces/default`, identity.json ->
+  `users.json`, known-dids -> `keys/`, `~/.agents-relay` ->
+  `<ws>/relay`, `~/.client` -> `<host>/clients`, `~/.agents-workspaces/*`
+  -> `workspaces/*`, deletes dead `~/.klanker/daemon.pid`, catch-all for
+  unknown entries.
+- `Host.has_legacy_layout()` public check used by local serves to refuse
+  unmigrated roots.
+
+### Added
 - `agents_workspace.compat.read_alias(env, new, old)`: shared deprecated-alias reader (new wins, old warns, one release).
 - `DOMAIN_ENV_ALIASES`: `AGENTS_MEMORY_PATH` -> `AGENTS_MEMORY_DIR`, `AGENTS_RELAY_STATE` -> `AGENTS_RELAY_DIR` (deprecated aliases, one release). `AGENTS_RULES_DIR` already canonical.
 

@@ -108,7 +108,7 @@ class TestCli(unittest.TestCase):
                 ["migrate"], {"AGENTS_HOST_DIR": tmp, "AGENTS_WORKSPACE": "a"}
             )
             self.assertEqual(code, 0)
-            self.assertIn("nothing to migrate", out)
+            self.assertIn("already migrated", out)
 
 
 if __name__ == "__main__":

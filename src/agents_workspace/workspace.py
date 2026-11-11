@@ -262,6 +262,10 @@ class Host:
     def host_paths(self) -> Path:
         return self.dir / "host_paths.json"
 
+    def has_legacy_layout(self) -> bool:
+        """Host was never migrated: no workspaces/, legacy domains on top."""
+        return Workspace._is_legacy_root(self.dir)
+
     def users_file(self, env: Mapping[str, str] | None = None) -> Path:
         env = {} if env is None else env
         raw = _clean(env, ENV_USERS_FILE)
@@ -428,6 +432,7 @@ class Workspace:
         _warn_domain_overrides(env)
         return ws
 
+    @staticmethod
     @staticmethod
     def _is_legacy_root(host_dir: Path) -> bool:
         """A host that was never migrated: no workspaces/, legacy domains on top."""
@@ -731,22 +736,18 @@ class Workspace:
         )
 
     def migrate(self, *, dry_run: bool = False) -> list[tuple[Path, Path]]:
-        """Move legacy ``<host>/<domain>`` dirs into this workspace (C80 expands)."""
-        moves: list[tuple[Path, Path]] = []
-        source_root = self.host.dir
-        if self.dir == source_root:
-            return moves
-        for name in DIR_DOMAINS:
-            src = source_root / name
-            dst = self.domain(name)
-            if not src.is_dir() or dst.exists():
-                continue
-            moves.append((src, dst))
-            if dry_run:
-                continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
-        return moves
+        """Move legacy host-level data into this workspace via the C80 planner."""
+        from .migrate import _norm, execute_migration, plan_migration
+
+        ws_root = _norm(self.dir)
+        moves = [
+            m
+            for m in plan_migration(self.host, ws_id=self.id)
+            if m.kind == "ws"
+            or (m.kind == "external" and _norm(m.dst).startswith(ws_root))
+        ]
+        execute_migration(moves, self.host, dry_run=dry_run)
+        return [(m.src, m.dst) for m in moves]
 
     @staticmethod
     def env_keys() -> tuple[str, ...]:
