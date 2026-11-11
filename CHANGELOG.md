@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
+
 ### Added
 - `docs/PERSONAS.md`: P2 persona rules home — equal personas (no
   hierarchy), first persona `default` per workspace, role as
