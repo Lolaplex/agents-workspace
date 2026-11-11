@@ -343,6 +343,38 @@ class TestLifecycle(unittest.TestCase):
             self.assertEqual(len(moves), 1)
             self.assertTrue((ws.dir / "memory" / "facts.md").is_file())
 
+    def test_delete_archives_to_trash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            out = host.delete("a")
+            self.assertFalse((host.workspaces_dir / "a").exists())
+            self.assertTrue((out / "workspace.json").is_file())
+            self.assertEqual(out.parent.name, ".trash")
+            self.assertEqual(host.list_workspaces(), [])
+
+    def test_delete_hard_removes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            host.delete("a", hard=True)
+            self.assertFalse((host.workspaces_dir / "a").exists())
+            self.assertFalse((host.workspaces_dir / ".trash").exists())
+
+    def test_delete_refuses_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            env = {"AGENTS_WORKSPACE": "a"}
+            with self.assertRaises(ValueError):
+                host.delete("a", env=env)
+
+    def test_delete_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            with self.assertRaises(ValueError):
+                host.delete("nope")
+
 
 class TestDeprecatedSurface(unittest.TestCase):
     def test_root_property(self):
