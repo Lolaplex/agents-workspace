@@ -208,6 +208,25 @@ class TestDomains(unittest.TestCase):
                 [str(w.message) for w in seen],
             )
 
+    def test_canonical_override_does_not_warn(self):
+        """An override equal to the resolved path is a pin, not an override."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            env = {
+                "AGENTS_HOST_DIR": tmp,
+                "AGENTS_WORKSPACE": "a",
+                "AGENTS_MEMORY_DIR": str(ws.dir / "memory"),
+                "AGENTS_TRACES_DIR": str(ws.dir / "traces"),
+                "AGENTS_USERS_FILE": str(Path(tmp) / "users.json"),
+            }
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                Workspace.from_env(env)
+            self.assertFalse(
+                any("domain env overrides" in str(w.message) for w in seen),
+                [str(w.message) for w in seen],
+            )
+
     def test_env_strips_foreign_and_legacy(self):
         with tempfile.TemporaryDirectory() as tmp:
             host = Host.open(tmp)

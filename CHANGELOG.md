@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
 
+### Fixed
+- Domain-override warning no longer fires when an `AGENTS_*_DIR`/users-file value equals the canonical resolved path (e.g. a serve process pinning its entry workspace env for children). Real divergent overrides still warn.
+
 ### Added
 - `docs/PERSONAS.md`: P2 persona rules home — equal personas (no
   hierarchy), first persona `default` per workspace, role as

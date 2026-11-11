@@ -175,12 +175,38 @@ def host_dir(env: Mapping[str, str] | None = None) -> Path:
     return default_host_dir()
 
 
-def _warn_domain_overrides(env: Mapping[str, str]) -> None:
+def _is_canonical(ws: "Workspace | None", domain: str, raw: str) -> bool:
+    """Override that just re-states the resolved path is not an override."""
+    if ws is None:
+        return False
+    # ws.dir / <domain> is the canonical layout; ws.<attr> would already carry
+    # the override when apply_overrides is set on the entry workspace.
+    return _path(raw) == ws.dir / domain
+
+
+def _is_canonical_users_file(ws: "Workspace | None", raw: str) -> bool:
+    if ws is None:
+        return False
+    return _path(raw) == ws.host.dir / "users.json"
+
+
+def _warn_domain_overrides(
+    env: Mapping[str, str], ws: "Workspace | None" = None
+) -> None:
     """Domain overrides are test/debug only (D-domain-overrides)."""
-    names = [v for v in DOMAIN_ENV.values() if _clean(env, v)]
-    names += [a for a in DOMAIN_ENV_ALIASES.values() if _clean(env, a)]
+    names = [
+        var
+        for domain, var in DOMAIN_ENV.items()
+        if _clean(env, var) and not _is_canonical(ws, domain, env[var])
+    ]
+    names += [
+        var
+        for domain, var in DOMAIN_ENV_ALIASES.items()
+        if _clean(env, var) and not _is_canonical(ws, domain, env[var])
+    ]
     for extra in (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY):
-        if _clean(env, extra):
+        raw = _clean(env, extra)
+        if raw and not _is_canonical_users_file(ws, raw):
             names.append(extra)
     if names:
         warnings.warn(
@@ -429,7 +455,7 @@ class Workspace:
         ws = host.select_workspace(env=env)
         workdir = cls._workdir_from_env(env, ws.dir)
         ws = replace(ws, workdir=workdir, source_env=env, apply_overrides=True)
-        _warn_domain_overrides(env)
+        _warn_domain_overrides(env, ws)
         return ws
 
     @staticmethod
