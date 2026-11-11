@@ -41,6 +41,20 @@ _HOST_FILES = (
     "mcp.json",
     "known-dids.jsonl",
 )
+# Legacy browser/chromium profile dirs stay host-level (they are profiles,
+# not the new <ws>/browser artifacts domain).
+_PROFILE_PREFIXES = ("browser-", "browser_", "chromium")
+# Legacy dirs that move under a host dir instead of staying top-level.
+_HOST_DIR_REMAP = {"repl": "clients"}
+# Legacy dirs that merge into a workspace domain (old aliases for the domain).
+_WS_DIR_REMAP = {"harness-content": "content"}
+# Legacy host files that move into a host subdir.
+_HOST_FILE_REMAP = {
+    "mcp-tools-cache.json": "cache",
+}
+# Host files whose destination may already exist and which are regenerable;
+# a stale legacy copy is deleted rather than merged or flagged.
+_REGENERABLE = {"mcp-tools-cache.json"}
 
 _EXT_WS_GLOBS = (".agents-workspaces", ".agents-relay", ".client", ".klanker")
 
@@ -49,10 +63,42 @@ _EXT_WS_GLOBS = (".agents-workspaces", ".agents-relay", ".client", ".klanker")
 class Move:
     src: Path
     dst: Path
-    kind: str  # "ws" | "host" | "external" | "delete"
+    kind: str  # "ws" | "host" | "external" | "delete" | "merge-users"
+    # populated during execution for kind == "merge-users"
+    merge_src_backup: str = ""
+    merge_backup: str = ""
 
     def to_dict(self) -> dict:
-        return {"src": str(self.src), "dst": str(self.dst), "kind": self.kind}
+        d = {"src": str(self.src), "dst": str(self.dst), "kind": self.kind}
+        if self.kind == "merge-users":
+            d["merge_src_backup"] = self.merge_src_backup
+            d["merge_backup"] = self.merge_backup
+        return d
+
+
+def _merge_users_file(m: Move) -> None:
+    """Union-merge legacy identity.json (src) into users.json (dst).
+
+    Existing dst rows win on key collision. Both original file bodies are
+    kept on the Move so the run log supports a byte-exact rollback.
+    """
+    src_body = m.src.read_text(encoding="utf-8")
+    dst_body = m.dst.read_text(encoding="utf-8")
+    m.merge_src_backup = src_body
+    m.merge_backup = dst_body
+    src = json.loads(src_body)
+    dst = json.loads(dst_body)
+    src_users = src.get("users") if isinstance(src, dict) else None
+    dst_users = dst.get("users") if isinstance(dst, dict) else None
+    if not isinstance(src_users, dict) or not isinstance(dst_users, dict):
+        raise RuntimeError(f"cannot merge users: bad schema in {m.src} or {m.dst}")
+    for key, row in src_users.items():
+        dst_users.setdefault(key, row)
+    tmp = m.dst.with_suffix(m.dst.suffix + ".tmp")
+    tmp.write_text(json.dumps(dst, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, m.dst)
+    m.src.unlink()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -81,8 +127,11 @@ def plan_migration(host: Host, ws_id: str = "default",
     if not host_dir.is_dir():
         return moves
 
-    # 1. workspace domain dirs
+    # 1. workspace domain dirs (legacy top-level "browser" is a profile, not
+    # the <ws>/browser artifacts domain -> handled with host dirs below)
     for name in DIR_DOMAINS:
+        if name == "browser":
+            continue
         src = host_dir / name
         if src.is_dir():
             moves.append(Move(src, ws_dir / name, "ws"))
@@ -96,17 +145,54 @@ def plan_migration(host: Host, ws_id: str = "default",
         src = host_dir / name
         if src.is_dir():
             moves.append(Move(src, host_dir / name, "host"))
+    # legacy aliases for ws domain dirs merge their children into the domain
+    for name, domain in _WS_DIR_REMAP.items():
+        src = host_dir / name
+        if not src.is_dir():
+            continue
+        dst_dir = ws_dir / domain
+        for child in sorted(src.iterdir()):
+            dst = dst_dir / child.name
+            if dst.exists() and child.is_file() and dst.is_file() \
+                    and child.read_bytes() == dst.read_bytes():
+                moves.append(Move(child, Path(""), "delete"))
+            else:
+                moves.append(Move(child, dst, "ws"))
+        moves.append(Move(src, Path(""), "delete"))
+    for name, sub in _HOST_DIR_REMAP.items():
+        src = host_dir / name
+        if src.is_dir():
+            moves.append(Move(src, host_dir / sub / name, "host"))
+    for entry in sorted(host_dir.iterdir()):
+        if entry.is_dir() and entry.name.startswith(_PROFILE_PREFIXES):
+            moves.append(Move(entry, entry, "host"))
     for name in _HOST_FILES:
         src = host_dir / name
         if not src.is_file():
             continue
         if name == "identity.json":
             dst = host_dir / "users.json"
+            kind = "merge-users" if dst.is_file() else "host"
         elif name == "known-dids.jsonl":
             dst = host_dir / "keys" / name
+            kind = "host"
         else:
             dst = host_dir / name
-        moves.append(Move(src, dst, "host"))
+            kind = "host"
+        moves.append(Move(src, dst, kind))
+    for name, sub in _HOST_FILE_REMAP.items():
+        src = host_dir / name
+        if not src.is_file():
+            continue
+        dst = host_dir / sub / name
+        if name in _REGENERABLE and dst.is_file():
+            moves.append(Move(src, Path(""), "delete"))
+        else:
+            moves.append(Move(src, dst, "host"))
+    prompt = host_dir / "klanker_prompt.txt"
+    if prompt.is_file():
+        moves.append(
+            Move(prompt, host_dir / "run" / f"klanker_prompt_{ws_id}.txt", "host"))
 
     # 4. external roots
     home = home or Path.home()
@@ -150,10 +236,11 @@ def _norm(path: Path) -> str:
 
 def _conflicts(moves: Iterable[Move]) -> list[Move]:
     moves = list(moves)
-    out = [m for m in moves if m.kind != "delete" and m.dst.exists()]
+    skip = ("delete", "merge-users")
+    out = [m for m in moves if m.kind not in skip and m.dst.exists()]
     seen: dict[str, Move] = {}
     for m in moves:
-        if m.kind == "delete":
+        if m.kind in skip:
             continue
         key = _norm(m.dst)
         if key in seen:
@@ -199,7 +286,14 @@ def execute_migration(moves: list[Move], host: Host, *,
         try:
             for m in moves:
                 if m.kind == "delete":
-                    m.src.unlink(missing_ok=True)
+                    if m.src.is_dir():
+                        m.src.rmdir()
+                    else:
+                        m.src.unlink(missing_ok=True)
+                    done.append(m)
+                    continue
+                if m.kind == "merge-users":
+                    _merge_users_file(m)
                     done.append(m)
                     continue
                 m.dst.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +304,11 @@ def execute_migration(moves: list[Move], host: Host, *,
             for m in reversed(done):
                 try:
                     if m.kind == "delete":
+                        continue
+                    if m.kind == "merge-users":
+                        if m.merge_backup:
+                            Path(m.dst).write_text(m.merge_backup, encoding="utf-8")
+                            Path(m.src).write_text(m.merge_src_backup, encoding="utf-8")
                         continue
                     m.src.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(m.dst), str(m.src))
@@ -239,6 +338,13 @@ def rollback(log_path: Path) -> int:
         dst = Path(m["dst"])
         if m["kind"] == "delete":
             continue  # cannot un-delete a dead pid file; it was stale anyway
+        if m["kind"] == "merge-users":
+            if m.get("merge_backup"):
+                dst.write_text(m["merge_backup"], encoding="utf-8")
+            if m.get("merge_src_backup") is not None:
+                src.write_text(m["merge_src_backup"], encoding="utf-8")
+            restored += 1
+            continue
         if not dst.exists():
             continue
         src.parent.mkdir(parents=True, exist_ok=True)
@@ -260,6 +366,8 @@ def run_cli(host: Host, *, ws_id: str = "default", dry_run: bool = False,
     for m in moves:
         if m.kind == "delete":
             print(f"{verb} (delete stale) {m.src}")
+        elif m.kind == "merge-users":
+            print(f"{verb} (merge users) {m.src} -> {m.dst}")
         else:
             print(f"{verb} {m.src} -> {m.dst}")
     conflicts = _conflicts(moves)
