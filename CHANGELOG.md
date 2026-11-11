@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Host.delete(id)` and `agents-workspace delete <id>`: archives the workspace to `workspaces/.trash/<id>-<utc>` (hidden from `list`, recoverable) or removes it entirely with `--hard`. Interactive runs ask for a type-to-confirm; `--force` skips the prompt (required non-interactively). Deleting the env-selected workspace (`AGENTS_WORKSPACE`) is refused.
+
 ### Changed
 - `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
 

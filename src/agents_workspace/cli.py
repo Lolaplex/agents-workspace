@@ -59,6 +59,32 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete(args: argparse.Namespace) -> int:
+    host = Host.from_env()
+    if not host.workspace_exists(args.id):
+        print(f"unknown workspace id: {args.id!r}", file=sys.stderr)
+        return 2
+    if not args.force:
+        if not sys.stdin.isatty():
+            print("refusing without --force in non-interactive mode",
+                  file=sys.stderr)
+            return 2
+        typed = input(f"Type {args.id} to confirm: ").strip()
+        if typed != args.id:
+            print("aborted", file=sys.stderr)
+            return 2
+    try:
+        out = host.delete(args.id, hard=args.hard)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.hard:
+        print(f"deleted {args.id}")
+    else:
+        print(f"archived {args.id} -> {out}")
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     rows = [ws.to_dict() for ws in Host.from_env().list_workspaces()]
     if args.json:
@@ -161,6 +187,17 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--label", default="")
     create.add_argument("--persona", default="")
     create.set_defaults(func=cmd_create)
+
+    delete = sub.add_parser(
+        "delete",
+        help="Archive <host>/workspaces/<id> to workspaces/.trash (or --hard remove).",
+    )
+    delete.add_argument("id")
+    delete.add_argument("--force", action="store_true",
+                        help="Skip the type-to-confirm prompt.")
+    delete.add_argument("--hard", action="store_true",
+                        help="Permanently delete instead of archiving.")
+    delete.set_defaults(func=cmd_delete)
 
     list_p = sub.add_parser("list", help="List every workspace on the host.")
     list_p.add_argument("--json", action="store_true")

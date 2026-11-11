@@ -406,6 +406,36 @@ class Host:
             f"({ENV_WORKSPACE} or --workspace)"
         )
 
+    def delete(
+        self,
+        ws_id: str,
+        *,
+        hard: bool = False,
+        env: Mapping[str, str] | None = None,
+    ) -> Path:
+        """Archive a workspace to ``workspaces/.trash/<id>-<utc>`` (default)
+        or remove it entirely (``hard=True``). Returns the archive path or
+        the removed root. Refuses the env-selected workspace."""
+        ws_id = _valid_id(ws_id)
+        selected = _clean(env if env is not None else os.environ, ENV_WORKSPACE)
+        if selected and selected == ws_id:
+            raise ValueError(
+                f"cannot delete the selected workspace {ws_id!r} "
+                f"(unset {ENV_WORKSPACE} first)"
+            )
+        root = self._workspaces_dir(env) / ws_id
+        if not (root / "workspace.json").is_file():
+            raise ValueError(f"unknown workspace id: {ws_id!r}")
+        if hard:
+            shutil.rmtree(root)
+            return root
+        trash = self._workspaces_dir(env) / ".trash"
+        trash.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dst = trash / f"{ws_id}-{stamp}"
+        shutil.move(str(root), str(dst))
+        return dst
+
 
 @dataclass(frozen=True)
 class Workspace:
