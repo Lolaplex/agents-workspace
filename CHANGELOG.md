@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<ws>/relay`, `~/.client` -> `<host>/clients`, `~/.agents-workspaces/*`
   -> `workspaces/*`, deletes dead `~/.klanker/daemon.pid`, catch-all for
   unknown entries.
+- Real-host hardening after dry-run on a live `~/.agents`: legacy
+  `browser*`/`chromium*` Chromium profile dirs stay host-level (the
+  `<ws>/browser` domain is for artifacts, not profiles); `identity.json`
+  union-merges into an existing `users.json` (byte-exact rollback of both
+  files); `harness-content` merges into `<ws>/content`; `repl` ->
+  `<host>/clients`, `mcp-tools-cache.json` -> `<host>/cache` (stale copy
+  deleted when a fresher one exists), `klanker_prompt.txt` ->
+  `<host>/run/klanker_prompt_<ws>.txt`.
 - `Host.has_legacy_layout()` public check used by local serves to refuse
   unmigrated roots.
 

@@ -170,6 +170,106 @@ class TestMigration(unittest.TestCase):
         self.host.create("a")
         self.assertEqual(plan_migration(self.host, home=self.home), [])
 
+    def test_browser_profiles_stay_on_host(self):
+        # legacy top-level browser* dirs are Chromium profiles, not the
+        # <ws>/browser artifacts domain
+        for name in ("browser", "browser-edge", "browser_test",
+                     "chromium-moodle"):
+            d = self.host_dir / name
+            d.mkdir(parents=True)
+            (d / "profile.bin").write_text(name, encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        bad = [m for m in moves if m.kind == "ws"
+               and ("browser" in m.src.name or "chromium" in m.src.name)]
+        self.assertEqual(bad, [])
+        execute_migration(moves, self.host)
+        for name in ("browser", "browser-edge", "browser_test",
+                     "chromium-moodle"):
+            self.assertTrue((self.host_dir / name / "profile.bin").is_file(), name)
+            self.assertFalse(
+                (self.host_dir / "workspaces" / "default" / name).exists(), name)
+
+    def test_identity_merges_into_existing_users(self):
+        self.host_dir.mkdir(parents=True)
+        (self.host_dir / "identity.json").write_text(
+            json.dumps({"users": {"u_a": {"id": "u_a", "aliases": ["a"]},
+                                  "u_b": {"id": "u_b", "aliases": ["b"]}}}),
+            encoding="utf-8")
+        (self.host_dir / "users.json").write_text(
+            json.dumps({"users": {"u_keep": {"did": "did:key:z1"}}}),
+            encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        merge = [m for m in moves if m.kind == "merge-users"]
+        self.assertEqual(len(merge), 1)
+        execute_migration(moves, self.host)
+        users = json.loads((self.host_dir / "users.json").read_text("utf-8"))["users"]
+        self.assertEqual(set(users), {"u_keep", "u_a", "u_b"})
+        self.assertEqual(users["u_keep"]["did"], "did:key:z1")
+        self.assertFalse((self.host_dir / "identity.json").exists())
+
+    def test_merge_users_rollback_restores_both_files(self):
+        self.host_dir.mkdir(parents=True)
+        ident_body = json.dumps({"users": {"u_a": {"id": "u_a"}}})
+        users_body = json.dumps({"users": {"u_keep": {"did": "did:key:z1"}}})
+        (self.host_dir / "identity.json").write_text(ident_body, encoding="utf-8")
+        (self.host_dir / "users.json").write_text(users_body, encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        log = execute_migration(moves, self.host)
+        rollback(log)
+        self.assertEqual(
+            (self.host_dir / "identity.json").read_text("utf-8"), ident_body)
+        self.assertEqual(
+            (self.host_dir / "users.json").read_text("utf-8"), users_body)
+
+    def test_host_file_and_dir_remaps(self):
+        self.host_dir.mkdir(parents=True)
+        (self.host_dir / "mcp-tools-cache.json").write_text("{}", encoding="utf-8")
+        (self.host_dir / "klanker_prompt.txt").write_text("p", encoding="utf-8")
+        (self.host_dir / "repl").mkdir(parents=True)
+        (self.host_dir / "repl" / "prefs.json").write_text("{}", encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertTrue(
+            (self.host_dir / "cache" / "mcp-tools-cache.json").is_file())
+        self.assertTrue(
+            (self.host_dir / "run" / "klanker_prompt_default.txt").is_file())
+        self.assertTrue(
+            (self.host_dir / "clients" / "repl" / "prefs.json").is_file())
+        self.assertFalse((self.host_dir / "klanker_prompt.txt").exists())
+        self.assertFalse((self.host_dir / "repl").exists())
+
+    def test_harness_content_merges_into_ws_content(self):
+        self.host_dir.mkdir(parents=True)
+        hc = self.host_dir / "harness-content"
+        (hc / "ab").mkdir(parents=True)
+        (hc / "ab" / "body.txt").write_text("clip", encoding="utf-8")
+        (hc / "same.txt").write_text("x", encoding="utf-8")
+        # pre-existing identical content in the target domain -> deleted
+        c = self.host_dir / "content"
+        (c).mkdir()
+        (c / "same.txt").write_text("x", encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        ws = self.host_dir / "workspaces" / "default" / "content"
+        self.assertTrue((ws / "ab" / "body.txt").is_file())
+        self.assertTrue((ws / "same.txt").is_file())
+        self.assertFalse((self.host_dir / "harness-content").exists())
+
+    def test_stale_regenerable_cache_is_deleted(self):
+        self.host_dir.mkdir(parents=True)
+        (self.host_dir / "mcp-tools-cache.json").write_text(
+            '{"old":true}', encoding="utf-8")
+        cache = self.host_dir / "cache"
+        cache.mkdir()
+        (cache / "mcp-tools-cache.json").write_text(
+            '{"new":true}', encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertFalse((self.host_dir / "mcp-tools-cache.json").exists())
+        self.assertEqual(
+            json.loads((cache / "mcp-tools-cache.json").read_text("utf-8")),
+            {"new": True})
+
 
 if __name__ == "__main__":
     unittest.main()
