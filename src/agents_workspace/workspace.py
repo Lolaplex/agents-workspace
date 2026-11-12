@@ -359,10 +359,15 @@ class Host:
         label: str = "",
         persona: str = "default",
         *,
+        isolation: str = "",
+        image: str = "",
         env: Mapping[str, str] | None = None,
     ) -> "Workspace":
         """Create ``<host>/workspaces/<id>`` plus its first persona."""
-        ws = self.workspace(ws_id, env=env).init(
+        base = self.workspace(ws_id, env=env)
+        if isolation or image:
+            base = replace(base, isolation=isolation, image=image)
+        ws = base.init(
             label=label or ws_id, default_persona=persona or "default"
         )
         persona_dir = ws.personas / ws.default_persona
