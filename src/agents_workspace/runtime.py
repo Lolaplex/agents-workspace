@@ -75,11 +75,28 @@ def docker_bin() -> str | None:
 
 
 def image_for(ws: Workspace, env: Mapping[str, str] | None = None) -> str:
-    return (
-        ws.image
-        or _env(env).get(ENV_IMAGE, "").strip()
-        or DEFAULT_IMAGE
-    )
+    """Explicit ws/env image wins; inside docker, default to the relay's
+    own image so ws containers run the same suite without a named tag."""
+    explicit = ws.image or _env(env).get(ENV_IMAGE, "").strip()
+    if explicit:
+        return explicit
+    own = _own_image()
+    return own or DEFAULT_IMAGE
+
+
+def _own_image() -> str:
+    """Config.Image of the container this process runs in (hostname=id)."""
+    if docker_bin() is None:
+        return ""
+    try:
+        out = _docker(
+            "inspect", "-f", "{{.Config.Image}}", os.environ.get("HOSTNAME", "")
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _container_name(ws: Workspace) -> str:
@@ -123,8 +140,8 @@ def ensure_container(
         "run", "-d",
         "--name", name,
         "--label", f"{LABEL}={ws.id}",
-        "-v", f"{ws.dir}:{CONTAINER_WS}",
-        "-w", str(_posix(workdir)),
+        "-v", f"{_host_mount(ws, env)}:{CONTAINER_WS}",
+        "-w", _to_container_path(ws, _posix(workdir)),
         image_for(ws, env),
         "sleep", "infinity",
     )
@@ -138,6 +155,26 @@ def ensure_container(
 
 def _posix(path) -> str:
     return str(path).replace("\\", "/")
+
+
+ENV_HOST_MAP = "AGENTS_WS_HOST_DIR"
+
+
+def _host_mount(ws: Workspace, env: Mapping[str, str] | None) -> str:
+    """Host-side path for the ws mount.
+
+    Inside a container the ws dir lives under a docker volume path that
+    differs from the daemon's view. ``AGENTS_WS_HOST_DIR`` names the
+    host-side equivalent of ``AGENTS_HOST_DIR`` so
+    ``<host_dir>/workspaces/<id>`` resolves to a real host path for
+    ``docker run -v``. Without it the container path is used as-is
+    (correct when relay and daemon share the fs view)."""
+    root = _posix(ws.dir)
+    host_map = _env(env).get(ENV_HOST_MAP, "").strip()
+    host_dir = _env(env).get("AGENTS_HOST_DIR", "").strip()
+    if host_map and host_dir and root.startswith(_posix(host_dir)):
+        return host_map.rstrip("/") + root[len(_posix(host_dir)):]
+    return root
 
 
 def _docker_env_flags(env: Mapping[str, str]) -> list[str]:
