@@ -29,6 +29,35 @@ CONTAINER_WS = "/ws"
 # ws.id -> monotonic timestamp of last spawned turn (warm-pool bookkeeping).
 _LAST_USE: dict[str, float] = {}
 
+# Host env prefixes forwarded into ws containers: suite config, LLM keys,
+# git/GitHub auth, proxies. Values travel via the docker client env
+# (``-e KEY``), never as ``-e KEY=VAL`` on the exec cmdline.
+ENV_PASSTHROUGH_PREFIXES = (
+    "AGENTS_",
+    "KLANKER_",
+    "LLM_",
+    "OPENAI_",
+    "OPENROUTER_",
+    "ANTHROPIC_",
+    "LMSTUDIO_",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_",
+    "RELAY_",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "TZ",
+    "LANG",
+)
+
+
+def _passthrough_keys(host_env: Mapping[str, str]) -> list[str]:
+    return [
+        k for k in host_env
+        if any(k.startswith(p) for p in ENV_PASSTHROUGH_PREFIXES)
+    ]
+
 
 def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
     return env if env is not None else os.environ
@@ -112,9 +141,11 @@ def _posix(path) -> str:
 
 
 def _docker_env_flags(env: Mapping[str, str]) -> list[str]:
+    """``-e KEY`` per var — docker takes the value from the client env,
+    keeping secrets out of host process listings."""
     flags: list[str] = []
-    for key, val in env.items():
-        flags += ["-e", f"{key}={val}"]
+    for key in env:
+        flags += ["-e", key]
     return flags
 
 
@@ -142,8 +173,9 @@ def spawn(
     if isolation_of(ws, env) != "container":
         return subprocess.Popen(argv, env=child_env, **kw)
     name = ensure_container(ws, env=env)
+    keys = set(env or {}) | set(_passthrough_keys(child_env))
     cmd = ["docker", "exec", "-i"]
-    cmd += _docker_env_flags(env or {})
+    cmd += _docker_env_flags({k: "" for k in sorted(keys)})
     cmd += [name, *argv]
     _LAST_USE[ws.id] = time.monotonic()
     return subprocess.Popen(cmd, env=child_env, **kw)
@@ -191,8 +223,9 @@ def run(
             env=child_env, timeout=timeout or None,
         )
     name = ensure_container(ws, env=env)
+    keys = set(env or {}) | set(_passthrough_keys(child_env))
     cmd = ["docker", "exec", "-i"]
-    cmd += _docker_env_flags(env or {})
+    cmd += _docker_env_flags({k: "" for k in sorted(keys)})
     cmd += [name, *argv]
     _LAST_USE[ws.id] = time.monotonic()
     return subprocess.run(
