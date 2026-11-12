@@ -210,11 +210,13 @@ def spawn(
     if isolation_of(ws, env) != "container":
         return subprocess.Popen(argv, env=child_env, **kw)
     name = ensure_container(ws, env=env)
-    keys = set(env or {}) | set(_passthrough_keys(child_env))
-    cmd = ["docker", "exec", "-i"]
-    cmd += _docker_env_flags({k: "" for k in sorted(keys)})
+    keys = _passthrough_keys(child_env)
+    cmd = [docker_bin() or "docker", "exec", "-i"]
+    cmd += _docker_env_flags({k: "" for k in keys})
     cmd += [name, *argv]
     _LAST_USE[ws.id] = time.monotonic()
+    if os.name != "nt":
+        kw["start_new_session"] = True
     return subprocess.Popen(cmd, env=child_env, **kw)
 
 
@@ -260,9 +262,9 @@ def run(
             env=child_env, timeout=timeout or None,
         )
     name = ensure_container(ws, env=env)
-    keys = set(env or {}) | set(_passthrough_keys(child_env))
-    cmd = ["docker", "exec", "-i"]
-    cmd += _docker_env_flags({k: "" for k in sorted(keys)})
+    keys = _passthrough_keys(child_env)
+    cmd = [docker_bin() or "docker", "exec", "-i"]
+    cmd += _docker_env_flags({k: "" for k in keys})
     cmd += [name, *argv]
     _LAST_USE[ws.id] = time.monotonic()
     return subprocess.run(
@@ -273,7 +275,7 @@ def run(
 
 def _to_container_path(ws: Workspace, value: str) -> str:
     """Map a host path under ``ws.dir`` to the container mount ``/ws``."""
-    raw = str(value or "")
+    raw = _posix(value or "")
     root = _posix(ws.dir).rstrip("/")
     if raw == root:
         return CONTAINER_WS

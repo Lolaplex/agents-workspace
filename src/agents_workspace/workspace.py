@@ -22,6 +22,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import shutil
 import warnings
 from dataclasses import dataclass, field, replace
@@ -433,6 +434,16 @@ class Host:
         root = self._workspaces_dir(env) / ws_id
         if not (root / "workspace.json").is_file():
             raise ValueError(f"unknown workspace id: {ws_id!r}")
+        try:
+            from .runtime import docker_bin, LABEL
+
+            if docker_bin() is not None:
+                subprocess.run(
+                    [docker_bin(), "rm", "-f", f"{LABEL}-{ws_id}"],
+                    capture_output=True, timeout=15,
+                )
+        except Exception:
+            pass  # container cleanup is best-effort; the sweep handles strays
         if hard:
             shutil.rmtree(root)
             return root
