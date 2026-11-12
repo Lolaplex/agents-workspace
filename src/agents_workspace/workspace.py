@@ -318,6 +318,8 @@ class Host:
             label=str(meta.get("label") or ""),
             default_persona=str(meta.get("default_persona") or "default"),
             parent_workspace=str(meta.get("parent_workspace") or ""),
+            isolation=str(meta.get("isolation") or ""),
+            image=str(meta.get("image") or ""),
             source_env=dict(env or {}),
             apply_overrides=False,
         )
@@ -448,6 +450,8 @@ class Workspace:
     label: str = ""
     default_persona: str = "default"
     parent_workspace: str = ""  # reserved for Track E job workspaces
+    isolation: str = ""  # manifest: local | container (runtime.py resolves)
+    image: str = ""  # optional container image override
     source_env: Mapping[str, str] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -523,6 +527,8 @@ class Workspace:
             label=str(meta.get("label") or ""),
             default_persona=str(meta.get("default_persona") or "default"),
             parent_workspace=str(meta.get("parent_workspace") or ""),
+            isolation=str(meta.get("isolation") or ""),
+            image=str(meta.get("image") or ""),
             source_env=dict(env),
             apply_overrides=True,
         )
@@ -557,6 +563,8 @@ class Workspace:
             label=str(meta.get("label") or ""),
             default_persona=str(meta.get("default_persona") or "default"),
             parent_workspace=str(meta.get("parent_workspace") or ""),
+            isolation=str(meta.get("isolation") or ""),
+            image=str(meta.get("image") or ""),
             source_env=env,
             apply_overrides=False,
         )
@@ -772,14 +780,29 @@ class Workspace:
 
     def init(self, *, label: str = "", default_persona: str = "") -> "Workspace":
         self.ensure()
-        meta = {
-            "id": self.id or self.dir.name or f"ws_{secrets.token_hex(8)}",
-            "label": label or self.label or self.dir.name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "default_persona": default_persona or self.default_persona or "default",
-        }
+        meta = {}
+        if self.workspace_file.is_file():
+            try:
+                prev = json.loads(self.workspace_file.read_text(encoding="utf-8"))
+                if isinstance(prev, dict):
+                    meta.update(prev)
+            except (OSError, json.JSONDecodeError):
+                pass
+        meta.update(
+            {
+                "id": self.id or self.dir.name or f"ws_{secrets.token_hex(8)}",
+                "label": label or self.label or self.dir.name,
+                "created_at": meta.get("created_at")
+                or datetime.now(timezone.utc).isoformat(),
+                "default_persona": default_persona or self.default_persona or "default",
+            }
+        )
         if self.parent_workspace:
             meta["parent_workspace"] = self.parent_workspace
+        if self.isolation:
+            meta["isolation"] = self.isolation
+        if self.image:
+            meta["image"] = self.image
         self.workspace_file.write_text(
             json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
