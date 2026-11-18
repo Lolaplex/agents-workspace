@@ -7,8 +7,7 @@ Every Workspace lives at ``<host>/workspaces/<id>`` and holds the domains
 rules, content, work). A workspace is selected per call by id
 (``AGENTS_WORKSPACE=<id>``), never by a process-global root.
 
-Deprecated aliases (one release, then removed): ``AGENTS_HOME`` ->
-``AGENTS_HOST_DIR``, ``AGENTS_WORKSPACE_DIR`` -> ``AGENTS_WORKDIR``,
+Deprecated aliases (one release, then removed): ``AGENTS_WORKSPACE_DIR`` -> ``AGENTS_WORKDIR``,
 ``AGENTS_IDENTITY_PATH`` -> ``AGENTS_USERS_FILE``,
 ``AGENTS_WORKSPACE_ROOT`` -> ad-hoc workspace dir,
 ``AGENTS_WORKSPACES_DIR`` -> ``<host>/workspaces``.
@@ -30,8 +29,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from .compat import read_alias
+
 ENV_HOST_DIR = "AGENTS_HOST_DIR"
-ENV_HOST_LEGACY = "AGENTS_HOME"  # deprecated alias, one release
 ENV_WORKSPACE = "AGENTS_WORKSPACE"  # workspace id, not a path
 ENV_WORKDIR = "AGENTS_WORKDIR"
 ENV_WORKDIR_LEGACY = "AGENTS_WORKSPACE_DIR"  # deprecated alias, one release
@@ -98,7 +98,6 @@ DOMAIN_ENV_ALIASES = {
 _ENV_KEYS = frozenset(
     (
         ENV_HOST_DIR,
-        ENV_HOST_LEGACY,
         ENV_WORKSPACE,
         ENV_WORKDIR,
         ENV_WORKDIR_LEGACY,
@@ -919,6 +918,79 @@ class Workspace:
             "secrets": str(self.secrets),
             "store": str(self.store),
         }
+
+
+def allowed_roots(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Path]:
+    """Dirs the workspace lock must not treat as escapes.
+
+    Single source for the root list the harness executor, the terminal
+    policy, and the delegate clamp honor: the workspace tree plus
+    explicitly listed host infra parts (keys, secrets, run, cache, logs,
+    clients, agents.json, mcp.json, users.json) plus env-listed dirs.
+    Host memory/skills do not exist — they are never allowed
+    (D-host-layer). Callers that also jail on the workdir add
+    ``ws.workdir`` themselves.
+    """
+    env = os.environ if env is None else env
+    host = ws.host
+    roots = [
+        ws.dir,
+        host.keys,
+        host.secrets,
+        host.run,
+        host.cache,
+        host.logs,
+        host.clients,
+        host.agents_json,
+        host.mcp_json,
+        host.users_file(),
+    ]
+    for key in (
+        "AGENTS_SKILLS_DIR",
+        "AGENTS_MODULES_DIR",
+        "AGENTS_MEMORY_PATH",
+        "AGENTS_TRACES_DIR",
+        "AGENTS_SCHEDULES_DIR",
+        "AGENTS_ROUTINE_RUNS_DIR",
+    ):
+        raw = _clean(env, key)
+        if raw:
+            roots.append(Path(raw).expanduser())
+    roots.extend(
+        Path(part.strip()).expanduser()
+        for part in _clean(env, "AGENTS_SKILLS_EXTRA").split(os.pathsep)
+        if part.strip()
+    )
+    allow = read_alias(env, "AGENTS_WORKDIR_ALLOW", "AGENTS_WORKSPACE_ALLOW")
+    roots.extend(
+        Path(part.strip()).expanduser() for part in allow.split(os.pathsep) if part.strip()
+    )
+    return roots
+
+
+def _json_dict(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_secret(
+    key: str, ws: Workspace | None = None, env: Mapping[str, str] | None = None
+) -> str:
+    """Resolve ``key``: ``<ws>/secrets.json`` -> ``<host>/secrets.json`` -> env.
+
+    Files are flat ``{"KEY": "value"}`` objects; first non-empty string wins.
+    A workspace-level value beats the host default, which beats the exported
+    env var. Returns "" when the key is nowhere set.
+    """
+    ws = ws or Workspace.from_env()
+    for path in (ws.secrets, ws.host.secrets):
+        val = _json_dict(path).get(key)
+        if isinstance(val, str) and val:
+            return val
+    return str((os.environ if env is None else env).get(key) or "")
 
 
 def current() -> Workspace:
