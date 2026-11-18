@@ -14,8 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `allowed_roots(ws, env=None)`: canonical list of dirs the workspace lock must not treat as escapes (ws tree, host infra, env-listed dirs, `AGENTS_WORKDIR_ALLOW`). Single source for `agents_terminal.policy`, `runner.executor`, and `runner.delegate`; callers add the workdir root themselves.
 - `resolve_secret(key, ws=None, env=None)`: secret lookup ordered `<ws>/secrets.json` → `<host>/secrets.json` → env (flat `{"KEY": "value"}` files, D-secrets). Lets a workspace pin per-ws keys without exporting them.
 - `docs/PERIMETER.md`: layer boundary table (HOST > WORKSPACE > PERSONA > SESSION) marking which boundary is kernel (openshell/container), env-hint (workdir lock, strippable via `env -u` — anti-accident only), or parent-enforced (approval, allowlist, env construction, secret precedence).
-
-### Added
 - `Host.delete(id)` and `agents-workspace delete <id>`: archives the workspace to `workspaces/.trash/<id>-<utc>` (hidden from `list`, recoverable) or removes it entirely with `--hard`. Interactive runs ask for a type-to-confirm; `--force` skips the prompt (required non-interactively). Deleting the env-selected workspace (`AGENTS_WORKSPACE`) is refused.
 
 ### Changed

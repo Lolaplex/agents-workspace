@@ -163,15 +163,11 @@ def default_host_dir() -> Path:
 
 
 def host_dir(env: Mapping[str, str] | None = None) -> Path:
-    """Resolve the Host dir: AGENTS_HOST_DIR > AGENTS_HOME (deprecated) > ~/.agents."""
+    """Resolve the Host dir: AGENTS_HOST_DIR > ~/.agents."""
     env = os.environ if env is None else env
     raw = _clean(env, ENV_HOST_DIR)
     if raw:
         return _path(raw)
-    legacy = _clean(env, ENV_HOST_LEGACY)
-    if legacy:
-        _deprecated(ENV_HOST_LEGACY, ENV_HOST_DIR)
-        return _path(legacy)
     return default_host_dir()
 
 
@@ -483,15 +479,6 @@ class Workspace:
             _deprecated(ENV_ROOT, f"{ENV_HOST_DIR} + {ENV_WORKSPACE}=<id>")
             _warn_domain_overrides(env)
             return cls._ad_hoc(ad_hoc, env)
-        legacy_home = _clean(env, ENV_HOST_LEGACY)
-        if legacy_home and not _clean(env, ENV_HOST_DIR):
-            # AGENTS_HOME used to name the workspace root itself. Treat it as
-            # a Host only once it actually looks like one (has workspaces/);
-            # an old-style root resolves as an ad-hoc workspace instead.
-            candidate = _path(legacy_home)
-            if not (candidate / "workspaces").is_dir():
-                _deprecated(ENV_HOST_LEGACY, f"{ENV_HOST_DIR} + {ENV_WORKSPACE}=<id>")
-                return cls._ad_hoc(legacy_home, env)
         host = Host.from_env(env)
         if _clean(env, ENV_WORKSPACE) == "" and cls._is_legacy_root(host.dir):
             # Pre-migration host: legacy domain dirs live at the host level.
