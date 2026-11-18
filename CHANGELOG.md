@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- `AGENTS_HOME` env var: the deprecated `AGENTS_HOST_DIR` alias is no longer read by `host_dir()` or `Workspace.from_env()`, and the old "home points at a workspace root" ad-hoc fallback is gone. Set `AGENTS_HOST_DIR`; `Workspace.env()` still strips inherited `AGENTS_HOME` values so children never see the dead name.
+
 ### Fixed
 - Runtime and migration subprocesses decode child output as UTF-8 (`errors="replace"`) instead of the locale default (`cp1252` on Western-European Windows). Non-ASCII tool output and child logs no longer corrupt.
 

@@ -23,20 +23,13 @@ class TestHostSelection(unittest.TestCase):
     def test_host_dir_env_wins(self):
         self.assertEqual(host_dir({"AGENTS_HOST_DIR": "/tmp/h"}), _p("/tmp/h"))
 
-    def test_host_home_alias_warns(self):
-        with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("always")
-            got = host_dir({"AGENTS_HOME": "/tmp/h"})
-        self.assertEqual(got, _p("/tmp/h"))
-        self.assertTrue(
-            any(w.category is DeprecationWarning for w in seen), "no DeprecationWarning"
+    def test_host_home_alias_removed(self):
+        # AGENTS_HOME is dead: no longer read, ignored silently.
+        self.assertEqual(host_dir({"AGENTS_HOME": "/tmp/h"}), Path.home() / ".agents")
+        self.assertEqual(
+            host_dir({"AGENTS_HOST_DIR": "/tmp/new", "AGENTS_HOME": "/tmp/old"}),
+            _p("/tmp/new"),
         )
-
-    def test_host_dir_beats_home(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            got = host_dir({"AGENTS_HOST_DIR": "/tmp/new", "AGENTS_HOME": "/tmp/old"})
-        self.assertEqual(got, _p("/tmp/new"))
 
     def test_host_default(self):
         self.assertEqual(host_dir({}), Path.home() / ".agents")

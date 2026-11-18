@@ -106,6 +106,7 @@ _ENV_KEYS = frozenset(
         ENV_WORKSPACES_DIR,
         ENV_ROOT,
         ENV_WORKSPACE_ID_LEGACY,
+        "AGENTS_HOME",  # dead alias: strip so children never inherit it
         "AGENTS_PERSONA",
         "AGENTS_KEYS_DIR",
         "AGENTS_MEMORY_DIR",

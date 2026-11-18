@@ -33,7 +33,7 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 ### Rules
 1. Names ending in `_DIR` are directory paths; names without suffix are ids. File-path vars use the `_FILE` suffix: `AGENTS_USERS_FILE` (alias `AGENTS_IDENTITY_PATH`, points to `<host>/users.json`), `AGENTS_KNOWN_DIDS_FILE` (alias `AGENTS_KNOWN_DIDS`), `AGENTS_MCP_CONFIG_FILE` (alias `AGENTS_MCP_CONFIG`), `AGENTS_MCP_CACHE_FILE` (alias `AGENTS_MCP_CACHE`), `AGENTS_SYNC_CONFIG_FILE` (alias `AGENTS_SYNC_CONFIG`) — alias 1 release each (decided (Klanker, technical, 10.11.) D-file-suffix).
 2. decided (Felix, 10.11.): host folder name — '.agents' stays, level named 'Host' in docs/env (`AGENTS_HOST_DIR`). The term is not `.klanker`. The term "home" disappears from code and output.
-3. All aliases last 1 release (decided (Klanker, technical, 10.11.) D-alias-policy): `AGENTS_HOME` is a deprecated alias of `AGENTS_HOST_DIR` (warning), then removal as a breaking change under `[Unreleased]`. Same policy for every other alias.
+3. All aliases last 1 release (decided (Klanker, technical, 10.11.) D-alias-policy): `AGENTS_HOME` → `AGENTS_HOST_DIR` completed the cycle and is now removed entirely (unreleased suite, coordinated rename). Same policy for every other alias.
 4. Removed/migrated: `AGENTS_WORKSPACE_ROOT`, `AGENTS_WORKSPACE_DIR` (-> `AGENTS_WORKDIR`), `AGENTS_WORKSPACES_DIR`, `AGENTS_DIR`, `~/.agents-workspaces`, `~/.agents-relay`, `~/.klanker/daemon.pid`.
 5. One `serve` per host. The workspace is passed explicitly per call; serve never switches `os.environ`. Env vars are only for child processes and at CLI entry.
 6. Domain overrides (`AGENTS_MEMORY_DIR` etc.) remain only for test/debug, apply only to the workspace chosen at CLI start, and emit a warning; serve ignores them per call (decided (Klanker, technical, 10.11.) D-domain-overrides).
@@ -49,7 +49,7 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 
 | Old | New | Level | Owner repo(s) | Action | Card |
 | --- | --- | --- | --- | --- | --- |
-| `AGENTS_HOME` | `AGENTS_HOST_DIR` | Host | agents-workspace (+ browser, keys) | alias 1 release, then remove | C10, C63, C64 |
+| `AGENTS_HOME` | `AGENTS_HOST_DIR` | Host | agents-workspace (+ browser, keys) | removed (was alias 1 release) | C10, C63, C64 |
 | `AGENTS_WORKSPACE_ROOT` | `AGENTS_HOST_DIR` + `AGENTS_WORKSPACE=<id>` | Host/Workspace | agents-workspace, klanker entrypoint, routine | remove + migrate | C10, C50, C20 |
 | `AGENTS_WORKSPACES_DIR`, `~/.agents-workspaces`, `/data/.agents-workspaces` | fixed `<host>/workspaces/<id>` | Host | agents-workspace, klanker entrypoint | remove + migrate | C10, C50, C80 |
 | `AGENTS_DIR` | `AGENTS_WORKSPACE=<id>` | Workspace | agents-sync | remove | C65 |

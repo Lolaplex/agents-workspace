@@ -61,8 +61,6 @@ exist, `Workspace.from_env()` errors (pass `AGENTS_WORKSPACE=<id>` or
 
 Deprecated aliases still read, with warnings:
 
-- `AGENTS_HOME` → `AGENTS_HOST_DIR` (a dir without `workspaces/` but with
-  legacy domain dirs still resolves as the workspace itself until `migrate`)
 - `AGENTS_WORKSPACE_DIR` → `AGENTS_WORKDIR`
 - `AGENTS_IDENTITY_PATH` → `AGENTS_USERS_FILE`
 - `AGENTS_WORKSPACES_DIR` → `<host>/workspaces`
