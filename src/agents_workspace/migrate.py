@@ -106,7 +106,7 @@ def _pid_alive(pid: int) -> bool:
         try:
             out = subprocess.check_output(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                text=True, encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace",
             )
         except Exception:
             return False

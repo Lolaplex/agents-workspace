@@ -432,3 +432,86 @@ class TestDomainAliases(unittest.TestCase):
             self.assertEqual(read_alias({"OLD": "b"}, "NEW", "OLD"), "b")
         self.assertTrue(any("deprecated" in str(w.message) for w in seen))
         self.assertEqual(read_alias({}, "NEW", "OLD"), "")
+
+
+class TestAllowedRoots(unittest.TestCase):
+    def test_ws_tree_and_host_infra(self):
+        from agents_workspace import allowed_roots
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).workspace("a")
+            roots = allowed_roots(ws, env={})
+            self.assertIn(ws.dir, roots)
+            for path in (
+                ws.host.keys, ws.host.secrets, ws.host.run, ws.host.cache,
+                ws.host.logs, ws.host.clients, ws.host.agents_json,
+                ws.host.mcp_json, ws.host.users_file(),
+            ):
+                self.assertIn(path, roots)
+            # the caller adds the workdir root itself (terminal only)
+            self.assertNotIn(ws.workdir, roots)
+
+    def test_env_listed_dirs(self):
+        from agents_workspace import allowed_roots
+
+        ws = Host.open("/tmp/h").workspace("a")
+        env = {
+            "AGENTS_SKILLS_DIR": "/tmp/sk",
+            "AGENTS_MEMORY_PATH": "/tmp/mem",
+            "AGENTS_SKILLS_EXTRA": f"/tmp/e1{os.pathsep}/tmp/e2",
+            "AGENTS_WORKDIR_ALLOW": "/tmp/ok",
+        }
+        roots = allowed_roots(ws, env=env)
+        for raw in ("/tmp/sk", "/tmp/mem", "/tmp/e1", "/tmp/e2", "/tmp/ok"):
+            self.assertIn(Path(raw).expanduser(), roots)
+
+    def test_allow_legacy_alias_warns(self):
+        from agents_workspace import allowed_roots
+
+        ws = Host.open("/tmp/h").workspace("a")
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            roots = allowed_roots(ws, env={"AGENTS_WORKSPACE_ALLOW": "/tmp/old"})
+        self.assertIn(Path("/tmp/old").expanduser(), roots)
+        self.assertTrue(
+            any("AGENTS_WORKSPACE_ALLOW is deprecated" in str(w.message) for w in seen)
+        )
+
+
+class TestResolveSecret(unittest.TestCase):
+    def _ws(self, tmp: str) -> Workspace:
+        host = Host.open(tmp)
+        ws = host.workspace("a")
+        ws.dir.mkdir(parents=True, exist_ok=True)
+        host.dir.mkdir(parents=True, exist_ok=True)
+        return ws
+
+    def test_ws_beats_host_beats_env(self):
+        import json
+        from agents_workspace import resolve_secret
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            ws.host.secrets.write_text(json.dumps({"K": "host"}), encoding="utf-8")
+            self.assertEqual(
+                resolve_secret("K", ws, env={"K": "env"}), "host"
+            )
+            ws.secrets.write_text(json.dumps({"K": "ws"}), encoding="utf-8")
+            self.assertEqual(resolve_secret("K", ws, env={"K": "env"}), "ws")
+
+    def test_env_fallback_and_missing(self):
+        from agents_workspace import resolve_secret
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            self.assertEqual(resolve_secret("K", ws, env={"K": "env"}), "env")
+            self.assertEqual(resolve_secret("NOPE", ws, env={}), "")
+
+    def test_bad_json_ignored(self):
+        from agents_workspace import resolve_secret
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._ws(tmp)
+            ws.secrets.write_text("{broken", encoding="utf-8")
+            ws.host.secrets.write_text('["not","a","dict"]', encoding="utf-8")
+            self.assertEqual(resolve_secret("K", ws, env={"K": "env"}), "env")

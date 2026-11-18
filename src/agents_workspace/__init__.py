@@ -18,9 +18,11 @@ from .workspace import (
     REMOVED_ENV,
     Host,
     Workspace,
+    allowed_roots,
     current,
     default_host_dir,
     host_dir,
+    resolve_secret,
 )
 
 __version__ = "0.1.0"
@@ -43,8 +45,10 @@ __all__ = [
     "REMOVED_ENV",
     "Host",
     "Workspace",
+    "allowed_roots",
     "current",
     "default_host_dir",
     "host_dir",
+    "resolve_secret",
     "__version__",
 ]
