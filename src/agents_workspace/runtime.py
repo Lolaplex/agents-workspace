@@ -107,7 +107,7 @@ def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [docker_bin() or "docker", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8", errors="replace",
     )
 
 
@@ -203,7 +203,7 @@ def spawn(
     child_env.update(env or {})
     kw = (
         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
-         "text": True, "bufsize": 1}
+         "encoding": "utf-8", "errors": "replace", "bufsize": 1}
         if pipes
         else {}
     )
@@ -258,7 +258,7 @@ def run(
     child_env.update(env or {})
     if isolation_of(ws, env) != "container":
         return subprocess.run(
-            argv, capture_output=capture, text=True,
+            argv, capture_output=capture, encoding="utf-8", errors="replace",
             env=child_env, timeout=timeout or None,
         )
     name = ensure_container(ws, env=env)
@@ -268,7 +268,7 @@ def run(
     cmd += [name, *argv]
     _LAST_USE[ws.id] = time.monotonic()
     return subprocess.run(
-        cmd, capture_output=capture, text=True,
+        cmd, capture_output=capture, encoding="utf-8", errors="replace",
         env=child_env, timeout=timeout or None,
     )
 

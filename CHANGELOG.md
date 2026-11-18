@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Runtime and migration subprocesses decode child output as UTF-8 (`errors="replace"`) instead of the locale default (`cp1252` on Western-European Windows). Non-ASCII tool output and child logs no longer corrupt.
+
 ### Added
 - `Host.delete(id)` and `agents-workspace delete <id>`: archives the workspace to `workspaces/.trash/<id>-<utc>` (hidden from `list`, recoverable) or removes it entirely with `--hard`. Interactive runs ask for a type-to-confirm; `--force` skips the prompt (required non-interactively). Deleting the env-selected workspace (`AGENTS_WORKSPACE`) is refused.
 
