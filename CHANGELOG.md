@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `agents_workspace.inbox` messaging schema (#17): tasks carry `from_persona`/`to_persona`, `thread_id` (`thr_…`, minted on create, kept across hops), `hop`/`max_hops` (default 0/3), `mode` (`ask`|`handoff`), `wake`, `status` (`open`|`running`|`done`|`failed`), `result`/`reply_summary`. `handoff` enforces the hop limit and the target's peer policy; `reply_task` writes result fields and returns the task to `from_persona` (hop-counted). `persona_meta()` reads `persona.json` — `accepts_messages: false` refuses all senders, `allow_peers` restricts who may address the persona. Task writes are tmp+`os.replace` atomic everywhere.
 - `agents_workspace.members`: `<ws>/members.json` registry (D-members) — `read_members`/`write_members` (`{members: [{id, role, did?}]}`, id-validated, atomic replace), `add_member`/`remove_member`, `member_role` for authz lookups, and `migrate_members` mapping `<host>/users.json` onto the member list (first mapped user becomes `owner` when none exists, the rest `member`; idempotent, removes nothing). Relay authz consumes `member_role`; the file is authored here, sync only merges.
 
 ### Fixed
