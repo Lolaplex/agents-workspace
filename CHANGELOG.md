@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `agents_workspace.members`: `<ws>/members.json` registry (D-members) — `read_members`/`write_members` (`{members: [{id, role, did?}]}`, id-validated, atomic replace), `add_member`/`remove_member`, `member_role` for authz lookups, and `migrate_members` mapping `<host>/users.json` onto the member list (first mapped user becomes `owner` when none exists, the rest `member`; idempotent, removes nothing). Relay authz consumes `member_role`; the file is authored here, sync only merges.
+
 ### Fixed
 - `inbox.handoff()` is now crash-atomic: the `handoff` event is persisted at the source inbox via tmp+`os.replace`, then the file moves with a single `os.replace` rename. A crash mid-handoff can no longer leave the task in two inboxes (duplicate owners) — at every point it lives in exactly one.
 
