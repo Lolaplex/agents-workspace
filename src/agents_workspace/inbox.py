@@ -71,7 +71,17 @@ def persona_inbox(ws: "Workspace", persona: str) -> Path:
 
 
 def _load(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    """Task JSON read; retries transient OS errors (a concurrent atomic
+    replace can briefly lock or unlink the path on Windows), then raises."""
+    err: OSError | None = None
+    for _ in range(25):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            err = exc
+            time.sleep(0.02)
+    assert err is not None
+    raise err
 
 
 def _save(path: Path, task: dict[str, Any]) -> None:
@@ -80,11 +90,32 @@ def _save(path: Path, task: dict[str, Any]) -> None:
     )
 
 
+def _replace(src: Path, dst: Path) -> None:
+    """os.replace with retry — on Windows a reader holding the destination
+    open without FILE_SHARE_DELETE (any open() handle), an AV scan, or an
+    indexer turns the rename into PermissionError; the window is short."""
+    err: PermissionError | None = None
+    for _ in range(50):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            err = exc
+            time.sleep(0.02)
+    assert err is not None
+    raise err
+
+
 def _write_task(path: Path, task: dict[str, Any]) -> None:
-    """Atomic task write: tmp file + replace, never a torn JSON body."""
-    tmp = path.with_suffix(".tmp")
-    _save(tmp, task)
-    os.replace(tmp, path)
+    """Atomic task write: unique tmp file + replace, never a torn JSON body."""
+    import secrets
+
+    tmp = path.with_suffix(f".{secrets.token_hex(6)}.tmp")
+    try:
+        _save(tmp, task)
+        _replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _relocate(ws: "Workspace", task: dict[str, Any], task_id: str,
@@ -93,7 +124,7 @@ def _relocate(ws: "Workspace", task: dict[str, Any], task_id: str,
     src = _task_path(persona_inbox(ws, owner), task_id)
     dst = _task_path(persona_inbox(ws, target), task_id)
     _write_task(src, task)
-    os.replace(src, dst)
+    _replace(src, dst)
 
 
 def persona_meta(ws: "Workspace", persona: str) -> dict[str, Any]:

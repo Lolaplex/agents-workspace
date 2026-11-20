@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `inbox.handoff()` is now crash-atomic: the `handoff` event is persisted at the source inbox via tmp+`os.replace`, then the file moves with a single `os.replace` rename. A crash mid-handoff can no longer leave the task in two inboxes (duplicate owners) — at every point it lives in exactly one.
+- Inbox task files survive transient Windows locks: `_write_task` now uses a unique tmp name per call (two writers can no longer collide on the shared `<id>.tmp`), and both the replace step (`_replace`, covering `_relocate`) and `_load` retry short PermissionError/OSError windows. A reader holding a task file open without `FILE_SHARE_DELETE` (any `open()` handle), an AV scan, or an indexer could otherwise turn a concurrent `os.replace` into PermissionError or a mid-replace open into a read failure — the cause of the flaky `handoff?wake=1` test failures (RemoteDisconnected / "never reached done") seen on Windows. POSIX behaviour is unchanged.
 
 ### Removed
 - `AGENTS_HOME` env var: the deprecated `AGENTS_HOST_DIR` alias is no longer read by `host_dir()` or `Workspace.from_env()`, and the old "home points at a workspace root" ad-hoc fallback is gone. Set `AGENTS_HOST_DIR`; `Workspace.env()` still strips inherited `AGENTS_HOME` values so children never see the dead name.
