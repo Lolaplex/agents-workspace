@@ -40,6 +40,8 @@ ENV_USERS_FILE_LEGACY = "AGENTS_IDENTITY_PATH"  # deprecated alias, one release
 ENV_WORKSPACES_DIR = "AGENTS_WORKSPACES_DIR"  # deprecated: <host>/workspaces
 ENV_ROOT = "AGENTS_WORKSPACE_ROOT"  # deprecated: ad-hoc workspace dir
 ENV_WORKSPACE_ID_LEGACY = "AGENTS_WORKSPACE_ID"
+ENV_DELEGATE_DEPTH = "AGENTS_DELEGATE_DEPTH"
+ENV_DELEGATE_MAX_DEPTH = "AGENTS_DELEGATE_MAX_DEPTH"
 
 # Env vars removed by the Host/Workspace split. Workspace.env() strips them
 # from child envs so a parent can never leak them into a turn.
@@ -954,6 +956,40 @@ def allowed_roots(ws: Workspace, env: Mapping[str, str] | None = None) -> list[P
         Path(part.strip()).expanduser() for part in allow.split(os.pathsep) if part.strip()
     )
     return roots
+
+
+def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
+    try:
+        return int(_clean(env, name)) or default
+    except ValueError:
+        return default
+
+
+def delegate_depth(env: Mapping[str, str] | None = None) -> int:
+    """Current ``AGENTS_DELEGATE_DEPTH`` (0 when unset or unparseable)."""
+    env = os.environ if env is None else env
+    return max(0, _int_env(env, ENV_DELEGATE_DEPTH, 0))
+
+
+def delegate_env(
+    env: Mapping[str, str] | None = None, *, max_depth: int = 0
+) -> dict[str, str]:
+    """Child env for a delegate turn: ``AGENTS_DELEGATE_DEPTH`` + 1.
+
+    Advisory anti-accident guard (env-hint, PERIMETER.md): the counter
+    travels in the child env so nested delegate turns accumulate depth.
+    ``max_depth`` defaults to ``AGENTS_DELEGATE_MAX_DEPTH`` or 8; hitting
+    the limit raises in the parent, which the child cannot reach. The
+    hard boundary stays the deploy container — in-turn isolation is
+    advisory, never a jail.
+    """
+    out = dict(os.environ if env is None else env)
+    limit = max_depth or _int_env(out, ENV_DELEGATE_MAX_DEPTH, 8)
+    depth = delegate_depth(out)
+    if depth >= limit:
+        raise ValueError(f"delegate depth limit reached ({depth}/{limit})")
+    out[ENV_DELEGATE_DEPTH] = str(depth + 1)
+    return out
 
 
 def _json_dict(path: Path) -> dict:

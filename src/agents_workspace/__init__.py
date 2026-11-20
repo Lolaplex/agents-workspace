@@ -20,6 +20,8 @@ from .workspace import (
     allowed_roots,
     current,
     default_host_dir,
+    delegate_depth,
+    delegate_env,
     host_dir,
     resolve_secret,
 )
@@ -46,6 +48,8 @@ __all__ = [
     "allowed_roots",
     "current",
     "default_host_dir",
+    "delegate_depth",
+    "delegate_env",
     "host_dir",
     "resolve_secret",
     "__version__",

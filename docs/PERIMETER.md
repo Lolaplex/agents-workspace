@@ -23,7 +23,7 @@ kernel boundary vs. a hint a child process can strip.
 | `agents-terminal` openshell driver | **kernel** | sandbox/container fs isolation; the child has no host fs to escape to |
 | ws `isolation=container` (`runtime.py`) | **kernel** | only `ws.dir` is mounted at `/ws`; other workspaces do not exist inside |
 | `AGENTS_WORKDIR_LOCK` + `allowed_roots()` | **env-hint** | the lock flag and allow list live in child env; `env -u AGENTS_WORKDIR_LOCK <cmd>` strips them |
-| `AGENTS_DELEGATE_DEPTH` / `MAX_DEPTH` | **env-hint** | depth counter travels in child env |
+| `AGENTS_DELEGATE_DEPTH` / `AGENTS_DELEGATE_MAX_DEPTH` | **env-hint** | depth counter travels in child env; refusal runs in the parent |
 | `AGENTS_APPROVAL_MODE` / `AGENTS_APPROVAL_CMD` | **parent-enforced** | the gate runs in the parent loop process; the model's `call_job` waits on the approver, nothing in the child reaches it |
 | `Workspace.env()` key strip + re-pin (C12, `REMOVED_ENV`) | **parent-enforced** | the parent builds the child env; foreign-workspace values never cross |
 | `TELEGRAM_ALLOWED_CHAT_IDS` / `AGENTS_RELAY_ALLOW_ANYONE` | **parent-enforced** | the allowlist is checked in the relay process before any turn exists |
@@ -44,3 +44,21 @@ kernel boundary vs. a hint a child process can strip.
   It lists *reachable* dirs, not *safe* ones — `host.keys` and
   `host.secrets` are on it so infra keeps working; a jail is not a
   secrecy boundary.
+
+## Delegate turns (agents-workspace#18)
+
+- A delegate/subagent child is a full `runner.loop` turn: it needs the
+  live workspace, provider env, memory and traces. An ephemeral
+  openshell snapshot cannot host it — that backend is upload-only and
+  carries no runtime.
+- **Delegates share the parent turn's privilege class.** The hard
+  boundary is the deploy container (`isolation=container` / the
+  Docker-perimeter deploy). In-turn isolation is advisory only.
+- `AGENTS_DELEGATE_DEPTH` (+ `AGENTS_DELEGATE_MAX_DEPTH`) is an
+  env-hint counter: `delegate_env()` increments it in the parent before
+  the child exists and refuses past the limit. It guards against
+  runaway recursion, not adversarial self-jailbreak — `env -u` strips it.
+- A real in-turn overlay waits on the ExecBackend interface
+  (agents-runtime#2 / harness#8). Until then delegates must run inside
+  the deploy perimeter: the delegate option is a deployment rule, not a
+  sandbox mechanism.

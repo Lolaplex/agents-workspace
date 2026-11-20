@@ -508,3 +508,45 @@ class TestResolveSecret(unittest.TestCase):
             ws.secrets.write_text("{broken", encoding="utf-8")
             ws.host.secrets.write_text('["not","a","dict"]', encoding="utf-8")
             self.assertEqual(resolve_secret("K", ws, env={"K": "env"}), "env")
+
+
+class TestDelegateEnv(unittest.TestCase):
+    def test_depth_parse_and_increment(self):
+        from agents_workspace import delegate_depth, delegate_env
+
+        self.assertEqual(delegate_depth({}), 0)
+        self.assertEqual(
+            delegate_depth({"AGENTS_DELEGATE_DEPTH": "3"}), 3)
+        self.assertEqual(
+            delegate_depth({"AGENTS_DELEGATE_DEPTH": "junk"}), 0)
+        child = delegate_env({"AGENTS_DELEGATE_DEPTH": "3",
+                              "OTHER": "keep"})
+        self.assertEqual(child["AGENTS_DELEGATE_DEPTH"], "4")
+        self.assertEqual(child["OTHER"], "keep")
+
+    def test_limit_refuses_in_parent(self):
+        from agents_workspace import delegate_env
+
+        with self.assertRaises(ValueError):
+            delegate_env({"AGENTS_DELEGATE_DEPTH": "8"})
+        with self.assertRaises(ValueError):
+            delegate_env({"AGENTS_DELEGATE_DEPTH": "2"}, max_depth=2)
+        # env-set limit honored
+        with self.assertRaises(ValueError):
+            delegate_env({"AGENTS_DELEGATE_DEPTH": "3",
+                          "AGENTS_DELEGATE_MAX_DEPTH": "3"})
+        # one below the limit still passes
+        out = delegate_env({"AGENTS_DELEGATE_DEPTH": "2",
+                            "AGENTS_DELEGATE_MAX_DEPTH": "3"})
+        self.assertEqual(out["AGENTS_DELEGATE_DEPTH"], "3")
+
+    def test_workspace_env_preserves_depth(self):
+        from agents_workspace import delegate_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).workspace("a")
+            child = ws.env(
+                {"AGENTS_DELEGATE_DEPTH": "2"})
+            self.assertEqual(child["AGENTS_DELEGATE_DEPTH"], "2")
+            nxt = delegate_env(child)
+            self.assertEqual(nxt["AGENTS_DELEGATE_DEPTH"], "3")
