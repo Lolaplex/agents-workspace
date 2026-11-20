@@ -16,6 +16,7 @@ Filesystem only; no network, no daemons.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -162,7 +163,11 @@ def handoff(
     task.setdefault("events", []).append(
         {"at": _ts(), "event": "handoff", "from": owner, "to": target, "note": note}
     )
-    _save(dst, task)
-    src.unlink()
+    # crash-atomic single-owner move: persist the event at the source
+    # first, then one rename — never a dup, never a lost task
+    tmp = src.with_suffix(".tmp")
+    _save(tmp, task)
+    os.replace(tmp, src)
+    os.replace(src, dst)
     task["owner"] = target
     return task

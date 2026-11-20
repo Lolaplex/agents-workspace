@@ -1,8 +1,11 @@
 """Persona inbox + explicit handoff ownership (P2, klanker#18)."""
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import agents_workspace.inbox as inbox_mod
 from agents_workspace import Host
 from agents_workspace.inbox import (
     create_task,
@@ -61,6 +64,45 @@ class PersonaInbox(unittest.TestCase):
 
     def test_find_task_unknown(self):
         self.assertIsNone(find_task(self.ws, "tsk_nope12345"))
+
+    def test_handoff_crash_never_dups(self):
+        # agents-workspace#14: a crash mid-handoff must leave the task in
+        # exactly one inbox — owner = location admits no duplicates.
+        task = create_task(self.ws, "default", "x")
+        tid = task["id"]
+
+        def inboxes():
+            return [p.name for p in self.ws.personas.iterdir()
+                    if (p / "inbox" / f"{tid}.json").is_file()]
+
+        # crash right after the destination write (pre-fix this left the
+        # task in both inboxes)
+        real_save = inbox_mod._save
+        def boom(path, t):
+            real_save(path, t)
+            raise RuntimeError("crash")
+        with patch.object(inbox_mod, "_save", boom):
+            with self.assertRaises(RuntimeError):
+                handoff(self.ws, tid, "cos")
+        self.assertEqual(len(inboxes()), 1)
+
+        # crash mid-move: still exactly one owner
+        real_replace = os.replace
+        calls = []
+        def boom2(a, b):
+            calls.append(b)
+            if len(calls) == 2:
+                raise RuntimeError("crash")
+            return real_replace(a, b)
+        with patch.object(os, "replace", boom2):
+            with self.assertRaises(RuntimeError):
+                handoff(self.ws, tid, "cos")
+        self.assertEqual(len(inboxes()), 1)
+
+        # a clean retry completes the handoff
+        handoff(self.ws, tid, "cos")
+        self.assertEqual(task_owner(self.ws, tid), "cos")
+        self.assertEqual(inboxes(), ["cos"])
 
 
 if __name__ == "__main__":
