@@ -632,6 +632,7 @@ class TestRoleScopedEnv(unittest.TestCase):
                 "AGENTS_SYNC_TOKEN": "st",
                 "AGENTS_APPROVAL_TOKEN": "aptok",
                 "GITHUB_TOKEN": "ght",
+                "GIT_ASKPASS": "/tmp/askpass.sh",
                 "OPENAI_API_KEY": "ok",
                 "ANTHROPIC_API_KEY": "ak",
                 "LLM_API_KEY": "lk",
@@ -648,7 +649,7 @@ class TestRoleScopedEnv(unittest.TestCase):
             tool = ws.env(base, role="tool", extra_allow=("GITHUB_TOKEN",))
             for k in ("RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY",
                       "ANTHROPIC_API_KEY", "LLM_API_KEY", "AGENTS_APPROVAL_TOKEN",
-                      "AGENTS_SYNC_TOKEN"):
+                      "AGENTS_SYNC_TOKEN", "GIT_ASKPASS"):
                 self.assertNotIn(k, tool)
             self.assertEqual(tool["GITHUB_TOKEN"], "ght")
 
