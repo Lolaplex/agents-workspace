@@ -313,6 +313,10 @@ class Host:
         return self.dir / "keys"
 
     @property
+    def secrets_dir(self) -> Path:
+        return self.dir / "secrets"
+
+    @property
     def secrets(self) -> Path:
         return self.dir / "secrets.json"
 
@@ -809,6 +813,10 @@ class Workspace:
         return self.dir / "config.json"
 
     @property
+    def secrets_dir(self) -> Path:
+        return self.dir / "secrets"
+
+    @property
     def secrets(self) -> Path:
         return self.dir / "secrets.json"
 
@@ -1033,7 +1041,7 @@ def denied_paths(ws: Workspace) -> list[Path]:
     return [
         host.keys,
         host.secrets,
-        host.dir / "secrets",
+        host.secrets_dir,
         host.mcp_json,
         host.dir / "mcp",
         host.agents_json,
@@ -1130,20 +1138,17 @@ def _json_dict(path: Path) -> dict:
 
 
 def resolve_secret(
-    key: str, ws: Workspace | None = None, env: Mapping[str, str] | None = None
+    key: str,
+    ws: Workspace | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    scope: str = "auto",
+    host: Host | None = None,
 ) -> str:
-    """Resolve ``key``: ``<ws>/secrets.json`` -> ``<host>/secrets.json`` -> env.
+    """Resolve ``key`` via Host Secret Vault (see ``agents_workspace.secrets``)."""
+    from .secrets import resolve_secret as _resolve
 
-    Files are flat ``{"KEY": "value"}`` objects; first non-empty string wins.
-    A workspace-level value beats the host default, which beats the exported
-    env var. Returns "" when the key is nowhere set.
-    """
-    ws = ws or Workspace.from_env()
-    for path in (ws.secrets, ws.host.secrets):
-        val = _json_dict(path).get(key)
-        if isinstance(val, str) and val:
-            return val
-    return str((os.environ if env is None else env).get(key) or "")
+    return _resolve(key, ws=ws, env=env, scope=scope, host=host)
 
 
 def current() -> Workspace:

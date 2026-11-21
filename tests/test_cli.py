@@ -110,6 +110,30 @@ class TestCli(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("already migrated", out)
 
+    def test_secrets_set_list_unset_and_doctor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_HOST_DIR": tmp, "AGENTS_KEYRING": "0"}
+            _run(["create", "a"], env)
+            code, out = _run(
+                ["secrets", "set", "OPENAI_API_KEY", "--scope", "workspace",
+                 "--workspace", "a", "--value", "secret-val-123"],
+                env,
+            )
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("secret-val-123", out)
+            code, out = _run(["secrets", "list", "--workspace", "a"], env)
+            self.assertEqual(code, 0)
+            self.assertEqual(out.strip(), "OPENAI_API_KEY")
+            code, out = _run(["doctor", "--json"], env)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["status"], "ok")
+            code, out = _run(
+                ["secrets", "unset", "OPENAI_API_KEY", "--scope", "workspace", "--workspace", "a"],
+                env,
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(json.loads(out)["removed"])
+
 
 if __name__ == "__main__":
     unittest.main()

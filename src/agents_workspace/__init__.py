@@ -1,5 +1,18 @@
 """agents-workspace: Host > Workspace > Persona > Session resolver."""
 
+from .secrets import (
+    ENV_KEYRING,
+    ENV_SECRETS_ORDER,
+    delete_secret,
+    doctor,
+    expand_secrets,
+    list_secret_names,
+    secret_inventory,
+    secrets_dir,
+    secrets_host_file,
+    secrets_ws_file,
+    write_secret,
+)
 from .workspace import (
     ALL_DOMAINS,
     DIR_DOMAINS,
@@ -39,7 +52,9 @@ __all__ = [
     "DOMAIN_ENV",
     "DOMAIN_ENV_ALIASES",
     "ENV_HOST_DIR",
+    "ENV_KEYRING",
     "ENV_ROOT",
+    "ENV_SECRETS_ORDER",
     "ENV_USERS_FILE",
     "ENV_USERS_FILE_LEGACY",
     "ENV_WORKDIR",
@@ -57,10 +72,19 @@ __all__ = [
     "default_host_dir",
     "delegate_depth",
     "delegate_env",
+    "delete_secret",
     "denied_paths",
+    "doctor",
+    "expand_secrets",
     "host_config",
     "host_dir",
+    "list_secret_names",
     "resolve_secret",
+    "secret_inventory",
+    "secrets_dir",
+    "secrets_host_file",
+    "secrets_ws_file",
     "workspace_config",
+    "write_secret",
     "__version__",
 ]
