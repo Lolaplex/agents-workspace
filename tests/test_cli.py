@@ -110,6 +110,70 @@ class TestCli(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("already migrated", out)
 
+    def test_secrets_set_list_unset_and_doctor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_HOST_DIR": tmp, "AGENTS_KEYRING": "0"}
+            _run(["create", "a"], env)
+            code, out = _run(
+                ["secrets", "set", "OPENAI_API_KEY", "--scope", "workspace",
+                 "--workspace", "a", "--value", "secret-val-123"],
+                env,
+            )
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("secret-val-123", out)
+            code, out = _run(["secrets", "list", "--workspace", "a"], env)
+            self.assertEqual(code, 0)
+            self.assertEqual(out.strip(), "OPENAI_API_KEY")
+            code, out = _run(["doctor", "--json"], env)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["status"], "ok")
+            code, out = _run(
+                ["secrets", "unset", "OPENAI_API_KEY", "--scope", "workspace", "--workspace", "a"],
+                env,
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(json.loads(out)["removed"])
+
+    def test_gc_prunes_only_old_archive_and_conflicts(self):
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_HOST_DIR": tmp}
+            _run(["create", "a"], env)
+            host_p = Path(tmp)
+            old_arch = host_p / "archive" / "old-stamp"
+            old_unclass = host_p / "archive" / "unclassified" / "old-junk.txt"
+            fresh_conf = host_p / "conflicts" / "fresh"
+            old_arch.mkdir(parents=True)
+            (old_arch / "x.txt").write_text("x", encoding="utf-8")
+            old_unclass.parent.mkdir(parents=True)
+            old_unclass.write_text("junk", encoding="utf-8")
+            fresh_conf.mkdir(parents=True)
+            (fresh_conf / "y.txt").write_text("y", encoding="utf-8")
+
+            stale_ts = time.time() - (45 * 86400)
+            os.utime(old_arch, (stale_ts, stale_ts))
+            os.utime(old_unclass, (stale_ts, stale_ts))
+
+            code, out = _run(["gc", "--older-than", "30d", "--dry-run", "--json"], env)
+            self.assertEqual(code, 0, out)
+            dry = json.loads(out)
+            self.assertTrue(dry["dry_run"])
+            self.assertEqual(dry["count"], 2)
+            self.assertTrue(old_arch.exists())
+            self.assertTrue(old_unclass.exists())
+
+            code, out = _run(["gc", "--older-than", "30d", "--json"], env)
+            self.assertEqual(code, 0, out)
+            real = json.loads(out)
+            self.assertFalse(real["dry_run"])
+            self.assertEqual(real["count"], 2)
+            self.assertFalse(old_arch.exists())
+            self.assertFalse(old_unclass.exists())
+            self.assertTrue(fresh_conf.exists())
+            self.assertTrue((host_p / "workspaces" / "a" / "workspace.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

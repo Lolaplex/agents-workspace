@@ -80,12 +80,19 @@ class TestContainerPath(unittest.TestCase):
 
 
 class TestPassthrough(unittest.TestCase):
-    def test_allowlist(self):
+    def test_allowlist_blocks_infra_and_unknown_agents_vars(self):
         keys = runtime._passthrough_keys(
             {
                 "GH_TOKEN": "x",
                 "OPENROUTER_API_KEY": "x",
                 "AGENTS_WORKSPACE": "w",
+                "AGENTS_BROWSER_PROFILE_NAME": "work",
+                "AGENTS_SYNC_TOKEN": "secret-sync",
+                "AGENTS_APPROVAL_TOKEN": "secret-app",
+                "GIT_ASKPASS": "/tmp/askpass",
+                "RELAY_SECRET": "rsec",
+                "RELAY_WEB_TOKEN": "rweb",
+                "TELEGRAM_BOT_TOKEN": "tbot",
                 "USERPROFILE": "C:/Users/x",
                 "RANDOM_SECRET": "x",
             }
@@ -93,8 +100,36 @@ class TestPassthrough(unittest.TestCase):
         self.assertIn("GH_TOKEN", keys)
         self.assertIn("OPENROUTER_API_KEY", keys)
         self.assertIn("AGENTS_WORKSPACE", keys)
-        self.assertNotIn("USERPROFILE", keys)
-        self.assertNotIn("RANDOM_SECRET", keys)
+        self.assertIn("AGENTS_BROWSER_PROFILE_NAME", keys)
+        for blocked in (
+            "AGENTS_SYNC_TOKEN",
+            "AGENTS_APPROVAL_TOKEN",
+            "GIT_ASKPASS",
+            "RELAY_SECRET",
+            "RELAY_WEB_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "USERPROFILE",
+            "RANDOM_SECRET",
+        ):
+            self.assertNotIn(blocked, keys)
+
+    def test_ensure_container_sets_hardening_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _ws(tmp, isolation="container")
+            calls = []
+
+            def fake_docker(*args):
+                calls.append(args)
+                if args[0] == "inspect":
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                return subprocess.CompletedProcess(args, 0, "ok", "")
+
+            with patch.object(runtime, "docker_bin", return_value="docker"), \
+                    patch.object(runtime, "_docker", side_effect=fake_docker):
+                runtime.ensure_container(ws, env={})
+            run_args = [c for c in calls if c[0] == "run"][0]
+            self.assertIn("--cap-drop=ALL", run_args)
+            self.assertIn("--security-opt=no-new-privileges", run_args)
 
 
 class TestSpawnLocal(unittest.TestCase):

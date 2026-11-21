@@ -8,8 +8,8 @@ kernel boundary vs. a hint a child process can strip.
 
 | Layer | Where | Contents | Boundary kind |
 | --- | --- | --- | --- |
-| **Host** | `AGENTS_HOST_DIR` (default `~/.agents`) | keys, secrets.json, run, cache, logs, clients, agents.json, mcp.json, users.json, browser profile | kernel (container scope) + parent-enforced (env construction) |
-| **Workspace** | `<host>/workspaces/<id>/` | domains (memory, skills, modules, rules, schedules, routine-runs, relay, traces, personas, content, work, browser artifacts) + ws files (secrets.json, mcp.json, members.json, store.db) | kernel when `isolation=container`; env-hint otherwise |
+| **Host** | `AGENTS_HOST_DIR` (default `~/.agents`) | keys, `secrets/{host,ws-<id>}.json`, run (`serve.json`, `approvals/`), cache, logs, `clients/desktop/`, providers, `agents.json`, `mcp.json`, `mcp/ws-<id>.json`, `approval-allowlist.json`, users.json, `browser/sessions/<name>` | kernel (container scope) + parent-enforced (env construction & vault) |
+| **Workspace** | `<host>/workspaces/<id>/` | lazy domains (memory, skills, modules, rules, schedules, routine-runs, relay, traces, personas, content, work, browser artifacts) + ephemeral `run/{delegates,procs}` + config files (`config.json`, `mcp.json`, `members.json`, `store.db`); zero secrets | kernel when `isolation=container`; env-hint otherwise |
 | **Persona** | `<ws>/personas/<id>/persona.json` | role, prompt addition, optional private notes | attribute only — no security boundary |
 | **Session** | `ses_…` under a persona | one turn's context, channel, workdir | attribute only — no security boundary |
 
@@ -24,11 +24,11 @@ kernel boundary vs. a hint a child process can strip.
 | ws `isolation=container` (`runtime.py`) | **kernel** | only `ws.dir` is mounted at `/ws`; other workspaces do not exist inside |
 | `AGENTS_WORKDIR_LOCK` + `allowed_roots()` | **env-hint** | the lock flag and allow list live in child env; `env -u AGENTS_WORKDIR_LOCK <cmd>` strips them |
 | `AGENTS_DELEGATE_DEPTH` / `AGENTS_DELEGATE_MAX_DEPTH` | **env-hint** | depth counter travels in child env; refusal runs in the parent |
-| `AGENTS_APPROVAL_MODE` / `AGENTS_APPROVAL_CMD` | **parent-enforced** | the gate runs in the parent loop process; the model's `call_job` waits on the approver, nothing in the child reaches it |
-| `Workspace.env()` key strip + re-pin (C12, `REMOVED_ENV`) | **parent-enforced** | the parent builds the child env; foreign-workspace values never cross |
+| `AGENTS_APPROVAL_MODE` / `AGENTS_APPROVAL_CMD` | **parent-enforced** | the gate runs in the parent loop process or authenticates over `/v1/approvals/` via ephemeral `AGENTS_APPROVAL_TOKEN` (`<host>/run/approvals/`); nothing in the child holds bot/webhook secrets |
+| `Workspace.env(..., role=...)` key strip + re-pin | **parent-enforced** | the parent builds role-scoped child envs (`turn`, `tool`, `acp`, `container`); infra secrets never enter turns/containers, and LLM/VCS tokens never enter `"tool"` or `"acp"` |
 | `TELEGRAM_ALLOWED_CHAT_IDS` / `AGENTS_RELAY_ALLOW_ANYONE` | **parent-enforced** | the allowlist is checked in the relay process before any turn exists |
-| `resolve_secret` file precedence (`<ws>/secrets.json` > `<host>/secrets.json` > env) | **parent-enforced** | a file pins the value; stripping or overriding the env var cannot beat it |
-| docker `-e KEY` env passthrough | **parent-enforced** | parent chooses which keys cross into the container; values never hit ws files |
+| `resolve_secret` host vault + `AGENTS_SECRETS_ORDER` | **parent-enforced** | host-infra secrets are locked `ENV > /run/secrets > keyring > host.json`; workspace files never override infra keys |
+| docker `-e KEY` env passthrough (`_SAFE_AGENTS_ENV`) | **parent-enforced** | parent allowlists safe keys crossing into `--cap-drop=ALL` `klanker-ws` containers; tokens/infra secrets stay blocked |
 
 ## Honest reading
 
@@ -39,11 +39,12 @@ kernel boundary vs. a hint a child process can strip.
 - Anything the child could plausibly want to defeat must live in the
   parent (approval, allowlist, env construction, secret resolution) or in
   the kernel (openshell, `isolation=container`).
-- `allowed_roots()` is the canonical allow list the lock honors
+- `allowed_roots()` and `denied_paths()` are the canonical jail lists
   (`agents_terminal.policy`, `runner.executor`, `runner.delegate`).
-  It lists *reachable* dirs, not *safe* ones — `host.keys` and
-  `host.secrets` are on it so infra keeps working; a jail is not a
-  secrecy boundary.
+  `denied_paths()` is evaluated first and explicitly blocks `host.keys`,
+  `host.secrets_dir`, `host.secrets`, `host.mcp_json`, `host.mcp_dir`,
+  `host.agents_json`, `host.users_file()`, `host.approval_allowlist`,
+  `ws.secrets`, and `ws.members`.
 
 ## Delegate turns (agents-workspace#18)
 

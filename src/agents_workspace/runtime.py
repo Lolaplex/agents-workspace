@@ -17,33 +17,87 @@ import subprocess
 import time
 from typing import Mapping
 
-from .workspace import Workspace
+from .workspace import INFRA_SECRET_KEYS, Workspace
 
 LABEL = "klanker-ws"
 ENV_ISOLATION = "AGENTS_WS_ISOLATION"
 ENV_IMAGE = "AGENTS_WS_IMAGE"
 ENV_TTL = "AGENTS_WS_IDLE_TTL"
+ENV_HOST_MAP = "AGENTS_WS_HOST_DIR"
 DEFAULT_IMAGE = "klanker:latest"
 CONTAINER_WS = "/ws"
 
 # ws.id -> monotonic timestamp of last spawned turn (warm-pool bookkeeping).
 _LAST_USE: dict[str, float] = {}
 
-# Host env prefixes forwarded into ws containers: suite config, LLM keys,
-# git/GitHub auth, proxies. Values travel via the docker client env
-# (``-e KEY``), never as ``-e KEY=VAL`` on the exec cmdline.
+# Explicit allowlist of safe ``AGENTS_*`` env keys allowed into containers.
+# Excludes tokens/secrets (AGENTS_SYNC_TOKEN, AGENTS_SYNC_SERVER_SECRET,
+# AGENTS_APPROVAL_TOKEN, AGENTS_ACP_API_KEY, AGENTS_TERMINAL_NOTIFY_SECRET).
+_SAFE_AGENTS_ENV = frozenset({
+    "AGENTS_HOST_DIR",
+    "AGENTS_WORKSPACE",
+    "AGENTS_WORKDIR",
+    "AGENTS_WORKSPACE_DIR",
+    "AGENTS_USERS_FILE",
+    "AGENTS_IDENTITY_PATH",
+    "AGENTS_DELEGATE_DEPTH",
+    "AGENTS_DELEGATE_MAX_DEPTH",
+    "AGENTS_PERSONA",
+    "AGENTS_KEYS_DIR",
+    "AGENTS_MEMORY_DIR",
+    "AGENTS_MEMORY_PATH",
+    "AGENTS_RELAY_DIR",
+    "AGENTS_RELAY_STATE",
+    "AGENTS_RULES_DIR",
+    "AGENTS_SKILLS_DIR",
+    "AGENTS_SKILLS_EXTRA",
+    "AGENTS_MODULES_DIR",
+    "AGENTS_SCHEDULES_DIR",
+    "AGENTS_TRACES_DIR",
+    "AGENTS_ROUTINE_RUNS_DIR",
+    "AGENTS_PERSONAS_DIR",
+    "AGENTS_CONTENT_DIR",
+    "AGENTS_BROWSER_HOME",
+    "AGENTS_BROWSER_PROFILE",
+    "AGENTS_BROWSER_PROFILE_NAME",
+    "AGENTS_BROWSER_SESSION",
+    "AGENTS_KNOWN_DIDS_FILE",
+    "AGENTS_KNOWN_DIDS",
+    "AGENTS_MCP_CONFIG_FILE",
+    "AGENTS_MCP_CONFIG",
+    "AGENTS_MCP_CACHE_FILE",
+    "AGENTS_MCP_CACHE",
+    "AGENTS_SYNC_CONFIG_FILE",
+    "AGENTS_SYNC_CONFIG",
+    "AGENTS_WORKDIR_ALLOW",
+    "AGENTS_WORKSPACE_ALLOW",
+    "AGENTS_WORKDIR_LOCK",
+    "AGENTS_WORKSPACE_LOCK",
+    "AGENTS_PROVIDER",
+    "AGENTS_MODEL",
+    "AGENTS_SECRETS_ORDER",
+    "AGENTS_NO_COLOR",
+    "AGENTS_LOG_LEVEL",
+})
+
+# Host env prefixes forwarded into ws containers: LLM keys, git/GitHub auth,
+# proxies, locale. Values travel via the docker client env (``-e KEY``),
+# never as ``-e KEY=VAL`` on the exec cmdline. ``RELAY_*`` and wildcard
+# ``AGENTS_*`` are intentionally excluded.
 ENV_PASSTHROUGH_PREFIXES = (
-    "AGENTS_",
     "KLANKER_",
     "LLM_",
     "OPENAI_",
     "OPENROUTER_",
     "ANTHROPIC_",
     "LMSTUDIO_",
+    "DEEPSEEK_",
+    "GEMINI_",
+    "GROQ_",
+    "MISTRAL_",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GIT_",
-    "RELAY_",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -53,10 +107,19 @@ ENV_PASSTHROUGH_PREFIXES = (
 
 
 def _passthrough_keys(host_env: Mapping[str, str]) -> list[str]:
-    return [
-        k for k in host_env
-        if any(k.startswith(p) for p in ENV_PASSTHROUGH_PREFIXES)
-    ]
+    blocked = INFRA_SECRET_KEYS | {
+        "AGENTS_SYNC_TOKEN",
+        "AGENTS_ACP_API_KEY",
+        "AGENTS_APPROVAL_TOKEN",
+        "GIT_ASKPASS",
+    }
+    out: list[str] = []
+    for k in host_env:
+        if k in blocked or k.startswith("RELAY_"):
+            continue
+        if k in _SAFE_AGENTS_ENV or any(k.startswith(p) for p in ENV_PASSTHROUGH_PREFIXES):
+            out.append(k)
+    return out
 
 
 def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -140,6 +203,8 @@ def ensure_container(
         "run", "-d",
         "--name", name,
         "--label", f"{LABEL}={ws.id}",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
         "-v", f"{_host_mount(ws, env)}:{CONTAINER_WS}",
         "-w", _to_container_path(ws, _posix(workdir)),
         image_for(ws, env),
@@ -155,9 +220,6 @@ def ensure_container(
 
 def _posix(path) -> str:
     return str(path).replace("\\", "/")
-
-
-ENV_HOST_MAP = "AGENTS_WS_HOST_DIR"
 
 
 def _host_mount(ws: Workspace, env: Mapping[str, str] | None) -> str:
@@ -186,21 +248,51 @@ def _docker_env_flags(env: Mapping[str, str]) -> list[str]:
     return flags
 
 
+def _merge_spawn_env(
+    env: Mapping[str, str] | None, merge: bool | None = None
+) -> dict[str, str]:
+    """Child env for spawn/run.
+
+    ``env=None`` inherits the host env minus INFRA secrets. ``merge=True``
+    overlays ``env`` on the same stripped host env (for partial overrides);
+    ``merge=False`` uses ``env`` verbatim (for complete envs such as
+    ``ws.env()``). ``merge=None`` keeps the one-release heuristic: an env
+    already carrying PATH is treated as complete.
+    """
+    if env is None:
+        return {
+            k: v for k, v in os.environ.items()
+            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
+        }
+    if merge is None:
+        merge = "PATH" not in env and "Path" not in env
+    if not merge:
+        return dict(env)
+    merged = {
+        k: v for k, v in os.environ.items()
+        if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
+    }
+    merged.update(env)
+    return merged
+
+
 def spawn(
     ws: Workspace,
     argv: list[str],
     env: Mapping[str, str] | None = None,
     *,
     pipes: bool = False,
+    merge: bool | None = None,
 ) -> subprocess.Popen:
     """Spawn ``argv`` under the workspace boundary.
 
     ``local``: plain subprocess with the merged env (status quo).
     ``container``: ``docker exec -i`` into the ws warm container, env
     passthrough via ``-e`` flags (secrets never hit ws files).
-    ``pipes=True`` wires stdout/stderr through PIPE for stream readers."""
-    child_env = dict(os.environ)
-    child_env.update(env or {})
+    ``pipes=True`` wires stdout/stderr through PIPE for stream readers.
+    ``merge``: ``True`` overlays ``env`` on the stripped host env, ``False``
+    uses it verbatim; ``None`` keeps the PATH-sniff heuristic (one release)."""
+    child_env = _merge_spawn_env(env, merge)
     kw = (
         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
          "encoding": "utf-8", "errors": "replace", "bufsize": 1}
@@ -252,10 +344,10 @@ def run(
     *,
     capture: bool = True,
     timeout: int = 0,
+    merge: bool | None = None,
 ) -> subprocess.CompletedProcess:
     """Blocking variant of spawn(): run argv under the ws boundary."""
-    child_env = dict(os.environ)
-    child_env.update(env or {})
+    child_env = _merge_spawn_env(env, merge)
     if isolation_of(ws, env) != "container":
         return subprocess.run(
             argv, capture_output=capture, encoding="utf-8", errors="replace",

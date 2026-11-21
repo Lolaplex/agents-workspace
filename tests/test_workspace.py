@@ -271,6 +271,7 @@ class TestDomains(unittest.TestCase):
             self.assertEqual(child["AGENTS_KEYS_DIR"], str(host.keys))
             self.assertEqual(child["AGENTS_USERS_FILE"], str(host.users_file()))
             self.assertEqual(child["AGENTS_IDENTITY_PATH"], str(host.users_file()))
+            self.assertEqual(child["AGENTS_BROWSER_PROFILE_NAME"], a.browser_profile)
             # persona + workdir params
             child2 = a.env(poison, persona="ops", workdir="/tmp/wd2")
             self.assertEqual(child2["AGENTS_PERSONA"], "ops")
@@ -306,8 +307,33 @@ class TestLifecycle(unittest.TestCase):
     def test_ensure_creates_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = Host.open(tmp).create("a")
+            self.assertTrue(ws.workspace_file.is_file())
+            self.assertTrue((ws.personas / "default" / "persona.json").is_file())
+            # Strict lazy: domain dirs are not materialized until written or ensured.
+            for lazy_dir in (ws.memory, ws.traces, ws.work, ws.skills):
+                self.assertFalse(lazy_dir.exists(), lazy_dir.name)
+            ws.ensure()
             for name in ("memory", "traces", "personas", "work"):
                 self.assertTrue(ws.domain(name).is_dir(), name)
+
+    def test_canonical_host_and_ws_paths(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            self.assertEqual(host.approval_allowlist, host.dir / "approval-allowlist.json")
+            self.assertEqual(host.providers, host.dir / "providers")
+            self.assertEqual(host.mcp_dir, host.dir / "mcp")
+            ws = host.create("a")
+            self.assertEqual(ws.run, ws.dir / "run")
+            self.assertEqual(ws.delegates, ws.dir / "run" / "delegates")
+            self.assertEqual(ws.procs, ws.dir / "run" / "procs")
+            self.assertEqual(ws.domain("run"), ws.run)
+            self.assertEqual(ws.browser_profile, "default")
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["browser_profile"] = "work-profile"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(ws.browser_profile, "work-profile")
 
     def test_init_writes_and_reloads_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,18 +455,26 @@ class TestDomainAliases(unittest.TestCase):
 
 class TestAllowedRoots(unittest.TestCase):
     def test_ws_tree_and_host_infra(self):
-        from agents_workspace import allowed_roots
+        from agents_workspace import allowed_roots, denied_paths
 
         with tempfile.TemporaryDirectory() as tmp:
             ws = Host.open(tmp).workspace("a")
             roots = allowed_roots(ws, env={})
+            denied = denied_paths(ws)
             self.assertIn(ws.dir, roots)
             for path in (
-                ws.host.keys, ws.host.secrets, ws.host.run, ws.host.cache,
-                ws.host.logs, ws.host.clients, ws.host.agents_json,
-                ws.host.mcp_json, ws.host.users_file(),
+                ws.host.run, ws.host.cache, ws.host.logs, ws.host.clients,
             ):
                 self.assertIn(path, roots)
+            for secret_path in (
+                ws.host.keys, ws.host.secrets, ws.host.dir / "secrets",
+                ws.host.mcp_json, ws.host.dir / "mcp",
+                ws.host.agents_json, ws.host.users_file(),
+                ws.host.dir / "approval-allowlist.json",
+                ws.secrets, ws.members,
+            ):
+                self.assertNotIn(secret_path, roots)
+                self.assertIn(secret_path, denied)
             # the caller adds the workdir root itself (terminal only)
             self.assertNotIn(ws.workdir, roots)
 
@@ -550,3 +584,84 @@ class TestDelegateEnv(unittest.TestCase):
             self.assertEqual(child["AGENTS_DELEGATE_DEPTH"], "2")
             nxt = delegate_env(child)
             self.assertEqual(nxt["AGENTS_DELEGATE_DEPTH"], "3")
+
+
+class TestSelectWorkspaceDefaults(unittest.TestCase):
+    def test_multi_ws_selects_default_or_configured_unless_strict(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("default")
+            host.create("work")
+            self.assertEqual(host.select_workspace().id, "default")
+            with self.assertRaises(ValueError):
+                host.select_workspace(strict=True)
+            host.agents_json.write_text(
+                json.dumps({"default_workspace": "work"}), encoding="utf-8"
+            )
+            self.assertEqual(host.select_workspace().id, "work")
+            host.agents_json.write_text(
+                json.dumps({"default_workspace": "missing"}), encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                host.select_workspace()
+
+    def test_host_and_workspace_config_helpers(self):
+        import json
+        from agents_workspace import host_config, workspace_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text(json.dumps({"node_id": "n1"}), encoding="utf-8")
+            ws = host.create("alpha")
+            self.assertEqual(host_config(host)["node_id"], "n1")
+            self.assertEqual(workspace_config(ws)["id"], "alpha")
+
+
+class TestRoleScopedEnv(unittest.TestCase):
+    def test_role_profiles_strip_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            base = {
+                "PATH": "/bin",
+                "RELAY_SECRET": "rsec",
+                "RELAY_WEB_TOKEN": "wtok",
+                "TELEGRAM_BOT_TOKEN": "ttok",
+                "AGENTS_SYNC_TOKEN": "st",
+                "AGENTS_APPROVAL_TOKEN": "aptok",
+                "GITHUB_TOKEN": "ght",
+                "GIT_ASKPASS": "/tmp/askpass.sh",
+                "OPENAI_API_KEY": "ok",
+                "ANTHROPIC_API_KEY": "ak",
+                "LLM_API_KEY": "lk",
+            }
+            turn = ws.env(base, role="turn", provider_key_env="OPENAI_API_KEY")
+            self.assertNotIn("RELAY_SECRET", turn)
+            self.assertNotIn("RELAY_WEB_TOKEN", turn)
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", turn)
+            self.assertNotIn("AGENTS_SYNC_TOKEN", turn)
+            self.assertEqual(turn["OPENAI_API_KEY"], "ok")
+            self.assertNotIn("ANTHROPIC_API_KEY", turn)
+            self.assertNotIn("LLM_API_KEY", turn)
+
+            tool = ws.env(base, role="tool", extra_allow=("GITHUB_TOKEN",))
+            for k in ("RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY",
+                      "ANTHROPIC_API_KEY", "LLM_API_KEY", "AGENTS_APPROVAL_TOKEN",
+                      "AGENTS_SYNC_TOKEN", "GIT_ASKPASS"):
+                self.assertNotIn(k, tool)
+            self.assertEqual(tool["GITHUB_TOKEN"], "ght")
+
+            acp = ws.env(base, role="acp")
+            for k in ("RELAY_SECRET", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                      "LLM_API_KEY", "GITHUB_TOKEN", "AGENTS_SYNC_TOKEN"):
+                self.assertNotIn(k, acp)
+
+            container = ws.env(base, role="container", provider_key_env="ANTHROPIC_API_KEY")
+            self.assertNotIn("RELAY_SECRET", container)
+            self.assertEqual(container["ANTHROPIC_API_KEY"], "ak")
+            self.assertNotIn("OPENAI_API_KEY", container)
+
+            with self.assertRaises(ValueError):
+                ws.env(base, role="bogus")

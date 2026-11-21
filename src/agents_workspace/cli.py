@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import re
+import shutil
 import sys
+import time
 import warnings
 from pathlib import Path
 
+from .secrets import (
+    delete_secret,
+    doctor,
+    list_secret_names,
+    secret_inventory,
+    write_secret,
+)
 from .workspace import ALL_DOMAINS, Host, Workspace
 
 
@@ -167,6 +178,148 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     )
 
 
+def _resolve_cli_ws(host: Host, ws_id: str) -> Workspace | None:
+    if ws_id:
+        if not host.workspace_exists(ws_id):
+            raise ValueError(f"unknown workspace id: {ws_id!r}")
+        return host.workspace(ws_id)
+    try:
+        return host.select_workspace()
+    except ValueError:
+        return None
+
+
+def cmd_secrets(args: argparse.Namespace) -> int:
+    host = Host.from_env()
+    sub = args.secrets_cmd
+    ws_id = getattr(args, "workspace", "") or ""
+    if sub == "list":
+        try:
+            ws = _resolve_cli_ws(host, ws_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.json:
+            _print(secret_inventory(host=host, ws=ws))
+            return 0
+        for name in list_secret_names(host=host, ws=ws, scope=args.scope):
+            print(name)
+        return 0
+    scope = args.scope
+    ws = None
+    if scope == "workspace" or ws_id:
+        try:
+            ws = host.workspace(ws_id) if ws_id and host.workspace_exists(ws_id) else (
+                Workspace.from_env() if not ws_id else None
+            )
+            if ws is None:
+                raise ValueError(f"unknown workspace id: {ws_id!r}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    if sub == "set":
+        raw = args.value
+        if raw is None:
+            if args.stdin or not sys.stdin.isatty():
+                raw = sys.stdin.read().rstrip("\r\n")
+            else:
+                raw = getpass.getpass(f"Value for {args.key}: ")
+        try:
+            out = write_secret(args.key, raw, host=host, ws=ws, scope=scope)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _print({"status": "ok", "key": args.key, "scope": scope, "path": str(out)})
+        return 0
+    if sub == "unset":
+        try:
+            removed = delete_secret(args.key, host=host, ws=ws, scope=scope)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _print({"status": "ok" if removed else "missing", "key": args.key, "removed": removed})
+        return 0
+    return 2
+
+
+def _parse_age_seconds(raw: str) -> float:
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*$", raw or "", re.IGNORECASE)
+    if not m:
+        raise ValueError(f"invalid duration: {raw!r} (expected e.g. 30d, 12h, 60m)")
+    num = float(m.group(1))
+    unit = (m.group(2) or "d").lower()
+    mult = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}[unit]
+    if num <= 0:
+        raise ValueError(f"duration must be positive: {raw!r}")
+    return num * mult
+
+
+def _gc_candidates(host: Host) -> list[Path]:
+    out: list[Path] = []
+    for base in (host.dir / "archive", host.dir / "conflicts"):
+        if not base.is_dir():
+            continue
+        for item in sorted(base.iterdir()):
+            if base.name == "archive" and item.name == "unclassified" and item.is_dir():
+                out.extend(sorted(item.iterdir()))
+            else:
+                out.append(item)
+    return out
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    try:
+        max_age = _parse_age_seconds(args.older_than)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    host = Host.from_env()
+    cutoff = time.time() - max_age
+    removed: list[str] = []
+    for item in _gc_candidates(host):
+        try:
+            mtime = item.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        removed.append(str(item))
+        if not args.dry_run:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink(missing_ok=True)
+    report = {
+        "host": str(host.dir),
+        "older_than": args.older_than,
+        "dry_run": bool(args.dry_run),
+        "count": len(removed),
+        "removed": removed,
+    }
+    if args.json:
+        _print(report)
+    else:
+        verb = "would remove" if args.dry_run else "removed"
+        print(f"gc ({args.older_than}): {verb} {len(removed)} entries")
+        for path in removed:
+            print(f"  {path}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    report = doctor(Host.from_env())
+    if args.json:
+        _print(report)
+    else:
+        print(f"host   {report['host']}")
+        print(f"status {report['status']} ({len(report['issues'])} issues)")
+        for issue in report["issues"]:
+            print(f"[{issue['severity']}] {issue['path']}: {issue['message']}")
+    if args.strict and report["issues"]:
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agents-workspace",
@@ -228,6 +381,40 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--rollback", default="", metavar="LOG",
                          help="Reverse a previous run using its JSON log.")
     migrate.set_defaults(func=cmd_migrate)
+
+    sec = sub.add_parser("secrets", help="Manage host-only secrets vault.")
+    sec_sub = sec.add_subparsers(dest="secrets_cmd", required=True)
+
+    sec_set = sec_sub.add_parser("set", help="Store a secret in host or ws vault.")
+    sec_set.add_argument("key")
+    sec_set.add_argument("--scope", choices=("host", "workspace"), default="host")
+    sec_set.add_argument("--workspace", default="")
+    sec_set.add_argument("--value", default=None)
+    sec_set.add_argument("--stdin", action="store_true")
+    sec_set.set_defaults(func=cmd_secrets)
+
+    sec_unset = sec_sub.add_parser("unset", help="Remove a secret from vault.")
+    sec_unset.add_argument("key")
+    sec_unset.add_argument("--scope", choices=("host", "workspace"), default="host")
+    sec_unset.add_argument("--workspace", default="")
+    sec_unset.set_defaults(func=cmd_secrets)
+
+    sec_list = sec_sub.add_parser("list", help="List secret key names (never values).")
+    sec_list.add_argument("--scope", choices=("all", "host", "workspace"), default="all")
+    sec_list.add_argument("--workspace", default="")
+    sec_list.add_argument("--json", action="store_true")
+    sec_list.set_defaults(func=cmd_secrets)
+
+    doc = sub.add_parser("doctor", help="Audit secret hygiene, permissions, and legacy state.")
+    doc.add_argument("--json", action="store_true")
+    doc.add_argument("--strict", action="store_true")
+    doc.set_defaults(func=cmd_doctor)
+
+    gc_p = sub.add_parser("gc", help="Prune aged entries from archive/ and conflicts/.")
+    gc_p.add_argument("--older-than", default="30d", help="Age threshold (e.g. 30d, 12h; default 30d).")
+    gc_p.add_argument("--dry-run", action="store_true")
+    gc_p.add_argument("--json", action="store_true")
+    gc_p.set_defaults(func=cmd_gc)
 
     return parser
 

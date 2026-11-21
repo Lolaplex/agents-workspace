@@ -27,7 +27,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from .compat import read_alias
 
@@ -46,6 +46,61 @@ ENV_DELEGATE_MAX_DEPTH = "AGENTS_DELEGATE_MAX_DEPTH"
 # Env vars removed by the Host/Workspace split. Workspace.env() strips them
 # from child envs so a parent can never leak them into a turn.
 REMOVED_ENV = ("AGENTS_DIR",)
+
+# Host infrastructure secrets must never reach agent turns, tool jails,
+# containers, or workspace overrides.
+INFRA_SECRET_KEYS = frozenset({
+    "RELAY_SECRET",
+    "GATEWAY_SECRET",
+    "RELAY_WEB_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "WEBHOOK_SECRET",
+    "DOCKER_HOST",
+    "AGENTS_SYNC_SERVER_SECRET",
+    "AGENTS_TERMINAL_NOTIFY_SECRET",
+})
+
+LLM_SECRET_KEYS = frozenset({
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "LMSTUDIO_API_KEY",
+    "AZURE_SPEECH_KEY",
+    "AZURE_TTS_KEY",
+})
+
+_TOOL_ONLY_STRIP_KEYS = frozenset({
+    "AGENTS_APPROVAL_TOKEN",
+    "AGENTS_ACP_API_KEY",
+    "AGENTS_SYNC_TOKEN",
+    "AGENTS_CALENDAR_PASSWORD",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GIT_ASKPASS",
+})
+
+_ACP_STRIP_PREFIXES = (
+    "LLM_",
+    "OPENAI_",
+    "OPENROUTER_",
+    "ANTHROPIC_",
+    "LMSTUDIO_",
+    "DEEPSEEK_",
+    "GEMINI_",
+    "GROQ_",
+    "MISTRAL_",
+    "AZURE_",
+    "RELAY_",
+    "TELEGRAM_",
+    "GIT_ASKPASS",
+)
+
+_ENV_ROLES = frozenset({"default", "turn", "tool", "acp", "container"})
 
 DIR_DOMAINS = (
     "memory",
@@ -114,7 +169,9 @@ _ENV_KEYS = frozenset(
         "AGENTS_MEMORY_DIR",
         "AGENTS_RELAY_DIR",
         "AGENTS_CONTENT_DIR",
+        "AGENTS_BROWSER_HOME",
         "AGENTS_BROWSER_PROFILE",
+        "AGENTS_BROWSER_PROFILE_NAME",
         "AGENTS_BROWSER_SESSION",
         "AGENTS_KNOWN_DIDS_FILE",
         "AGENTS_KNOWN_DIDS",
@@ -216,15 +273,22 @@ def _warn_domain_overrides(
         )
 
 
+def host_config(
+    host: "Host | None" = None, *, env: Mapping[str, str] | None = None
+) -> dict:
+    """Read ``<host>/agents.json`` as a dict (empty dict when absent/invalid)."""
+    target = host or Host.from_env(env)
+    return _json_dict(target.agents_json)
+
+
+def workspace_config(ws: "Workspace | None" = None) -> dict:
+    """Read ``<ws>/workspace.json`` as a dict (empty dict when absent/invalid)."""
+    target = ws or Workspace.from_env()
+    return _json_dict(target.dir / "workspace.json")
+
+
 def _read_meta(root: Path) -> dict:
-    path = root / "workspace.json"
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _json_dict(root / "workspace.json")
 
 
 @dataclass(frozen=True)
@@ -250,6 +314,10 @@ class Host:
     @property
     def keys(self) -> Path:
         return self.dir / "keys"
+
+    @property
+    def secrets_dir(self) -> Path:
+        return self.dir / "secrets"
 
     @property
     def secrets(self) -> Path:
@@ -282,6 +350,18 @@ class Host:
     @property
     def mcp_json(self) -> Path:
         return self.dir / "mcp.json"
+
+    @property
+    def mcp_dir(self) -> Path:
+        return self.dir / "mcp"
+
+    @property
+    def providers(self) -> Path:
+        return self.dir / "providers"
+
+    @property
+    def approval_allowlist(self) -> Path:
+        return self.dir / "approval-allowlist.json"
 
     @property
     def host_paths(self) -> Path:
@@ -388,12 +468,18 @@ class Host:
         return ws
 
     def select_workspace(
-        self, ws_id: str | None = None, *, env: Mapping[str, str] | None = None
+        self,
+        ws_id: str | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        strict: bool = False,
     ) -> "Workspace":
-        """explicit id > AGENTS_WORKSPACE > the only existing workspace.
+        """explicit id > AGENTS_WORKSPACE > the only existing workspace > default_workspace.
 
-        First start (no workspaces yet) creates ``default``. Several existing
-        workspaces without an id is an error (D-default-ws).
+        First start (no workspaces yet) creates ``default``. When several
+        workspaces exist without an id, non-strict callers resolve
+        ``agents.json -> default_workspace`` or an existing ``default``
+        workspace; ``strict=True`` raises ``ValueError``.
         """
         ws_id = (ws_id or "").strip()
         if not ws_id and env is not None:
@@ -407,6 +493,16 @@ class Host:
             return self.create("default", env=env)
         if len(found) == 1:
             return found[0]
+        if not strict:
+            configured = str(host_config(self).get("default_workspace") or "").strip()
+            if configured:
+                if not self.workspace_exists(configured, env=env):
+                    raise ValueError(
+                        f"configured default_workspace does not exist: {configured!r}"
+                    )
+                return self.workspace(configured, env=env)
+            if self.workspace_exists("default", env=env):
+                return self.workspace("default", env=env)
         raise ValueError(
             "several workspaces exist; pass a workspace id "
             f"({ENV_WORKSPACE} or --workspace)"
@@ -498,13 +594,13 @@ class Workspace:
         return ws
 
     @staticmethod
-    @staticmethod
     def _is_legacy_root(host_dir: Path) -> bool:
         """A host that was never migrated: no workspaces/, legacy domains on top."""
         if (host_dir / "workspaces").is_dir():
             return False
         markers = (
             "memory",
+            "rules",
             "skills",
             "modules",
             "schedules",
@@ -512,6 +608,8 @@ class Workspace:
             "routine-runs",
             "relay",
             "personas",
+            "content",
+            "work",
             "workspace.json",
             "store.db",
             "identity.json",
@@ -716,6 +814,25 @@ class Workspace:
         return self.dir / "browser"
 
     @property
+    def browser_profile(self) -> str:
+        """Host browser session profile name for this workspace."""
+        val = str(_read_meta(self.dir).get("browser_profile") or "").strip()
+        return val or "default"
+
+    @property
+    def run(self) -> Path:
+        """Ephemeral runtime dir under the workspace (never synced)."""
+        return self.dir / "run"
+
+    @property
+    def delegates(self) -> Path:
+        return self.run / "delegates"
+
+    @property
+    def procs(self) -> Path:
+        return self.run / "procs"
+
+    @property
     def claude(self) -> Path:
         return Path.home() / ".claude"
 
@@ -730,6 +847,10 @@ class Workspace:
     @property
     def config(self) -> Path:
         return self.dir / "config.json"
+
+    @property
+    def secrets_dir(self) -> Path:
+        return self.dir / "secrets"
 
     @property
     def secrets(self) -> Path:
@@ -770,6 +891,7 @@ class Workspace:
             "sync_config": self.sync_config,
             "mcp": self.mcp_json,
             "calendar": self.calendar,
+            "run": self.run,
         }
         if key in table:
             return table[key]
@@ -784,7 +906,8 @@ class Workspace:
         return self
 
     def init(self, *, label: str = "", default_persona: str = "") -> "Workspace":
-        self.ensure()
+        """Write ``workspace.json`` lazily without pre-creating empty domain dirs."""
+        self.dir.mkdir(parents=True, exist_ok=True)
         meta = {}
         if self.workspace_file.is_file():
             try:
@@ -844,16 +967,54 @@ class Workspace:
         *,
         persona: str = "",
         workdir: str | Path | None = None,
+        role: str = "default",
+        provider_key_env: str = "",
+        extra_allow: Iterable[str] = (),
     ) -> dict[str, str]:
         """Process env for a turn or job inside this workspace.
 
         Sets every resolver-owned key to this workspace's paths (new names
         plus one-release aliases) and strips removed keys, so no value from
         a parent process or a foreign workspace can leak into the child.
+        ``role`` narrows sensitive secrets by execution role: ``default``,
+        ``turn``, ``tool``, ``acp``, or ``container``. When ``provider_key_env``
+        is empty on ``turn``/``container``, LLM provider keys stay intact to
+        support interactive per-chat model switching.
         """
-        out = dict(os.environ if base is None else base)
+        if role not in _ENV_ROLES:
+            raise ValueError(f"unknown workspace env role: {role!r}")
+        raw_base = dict(os.environ if base is None else base)
+        out = dict(raw_base)
         for key in _ENV_KEYS:
             out.pop(key, None)
+        allow = {str(k).strip() for k in extra_allow if str(k).strip()}
+        if role != "default":
+            for key in INFRA_SECRET_KEYS:
+                if key not in allow:
+                    out.pop(key, None)
+            if "AGENTS_SYNC_TOKEN" not in allow:
+                out.pop("AGENTS_SYNC_TOKEN", None)
+        if role in ("turn", "container") and provider_key_env:
+            for key in LLM_SECRET_KEYS:
+                if key != provider_key_env and key not in allow:
+                    out.pop(key, None)
+        elif role == "tool":
+            for key in (*LLM_SECRET_KEYS, *_TOOL_ONLY_STRIP_KEYS):
+                if key not in allow:
+                    out.pop(key, None)
+        elif role == "acp":
+            for key in list(out):
+                if key in allow:
+                    continue
+                if (
+                    key in LLM_SECRET_KEYS
+                    or key in _TOOL_ONLY_STRIP_KEYS
+                    or any(key.startswith(p) for p in _ACP_STRIP_PREFIXES)
+                ):
+                    out.pop(key, None)
+        for key in allow:
+            if key in raw_base and key not in _ENV_KEYS:
+                out[key] = raw_base[key]
         workdir_p = _path(str(workdir)) if workdir else self.workdir
         out[ENV_HOST_DIR] = str(self.host.dir)
         out[ENV_WORKSPACE] = self.id
@@ -873,7 +1034,8 @@ class Workspace:
             ("AGENTS_ROUTINE_RUNS_DIR", None, self.routine_runs),
             ("AGENTS_PERSONAS_DIR", None, self.personas),
             ("AGENTS_CONTENT_DIR", None, self.content),
-            ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION", host.browser),
+            ("AGENTS_BROWSER_HOME", None, host.browser),
+            ("AGENTS_BROWSER_PROFILE_NAME", None, self.browser_profile),
             (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY, self.identity),
             ("AGENTS_KNOWN_DIDS_FILE", "AGENTS_KNOWN_DIDS",
              host.keys / "known-dids.jsonl"),
@@ -886,6 +1048,13 @@ class Workspace:
             out[new_name] = str(value)
             if alias:
                 out[alias] = str(value)
+        # AGENTS_BROWSER_PROFILE/SESSION are pass-through only: an explicit
+        # caller choice (profile name or dir) survives, but env() no longer
+        # overloads PROFILE with the browser state root — AGENTS_BROWSER_HOME
+        # carries that.
+        for legacy in ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION"):
+            if raw_base.get(legacy):
+                out[legacy] = raw_base[legacy]
         return out
 
     # --- reporting -----------------------------------------------------
@@ -910,30 +1079,48 @@ class Workspace:
         }
 
 
+def denied_paths(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Path]:
+    """Paths always denied to terminal/agent file & shell tools.
+
+    Evaluated before ``allowed_roots(ws)`` so host secrets, private keys,
+    and control-plane files (or sensitive files inside ``ws.dir``) stay
+    unreachable even when ``ws.dir`` itself is allowed.
+    """
+    host = ws.host
+    env_map = ws.source_env if env is None and ws.source_env else env
+    return [
+        host.keys,
+        host.secrets,
+        host.secrets_dir,
+        host.mcp_json,
+        host.mcp_dir,
+        host.agents_json,
+        host.users_file(env_map),
+        host.approval_allowlist,
+        ws.secrets,
+        ws.members,
+    ]
+
+
 def allowed_roots(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Path]:
     """Dirs the workspace lock must not treat as escapes.
 
     Single source for the root list the harness executor, the terminal
     policy, and the delegate clamp honor: the workspace tree plus
-    explicitly listed host infra parts (keys, secrets, run, cache, logs,
-    clients, agents.json, mcp.json, users.json) plus env-listed dirs.
-    Host memory/skills do not exist — they are never allowed
-    (D-host-layer). Callers that also jail on the workdir add
-    ``ws.workdir`` themselves.
+    non-secret host runtime dirs (run, cache, logs, clients) plus
+    env-listed dirs. Keys, secrets, control-plane files, and MCP configs
+    are excluded (see ``denied_paths(ws)``). Host memory/skills do not
+    exist — they are never allowed (D-host-layer). Callers that also
+    jail on the workdir add ``ws.workdir`` themselves.
     """
     env = os.environ if env is None else env
     host = ws.host
     roots = [
         ws.dir,
-        host.keys,
-        host.secrets,
         host.run,
         host.cache,
         host.logs,
         host.clients,
-        host.agents_json,
-        host.mcp_json,
-        host.users_file(),
     ]
     for key in (
         "AGENTS_SKILLS_DIR",
@@ -1001,20 +1188,17 @@ def _json_dict(path: Path) -> dict:
 
 
 def resolve_secret(
-    key: str, ws: Workspace | None = None, env: Mapping[str, str] | None = None
+    key: str,
+    ws: Workspace | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    scope: str = "auto",
+    host: Host | None = None,
 ) -> str:
-    """Resolve ``key``: ``<ws>/secrets.json`` -> ``<host>/secrets.json`` -> env.
+    """Resolve ``key`` via Host Secret Vault (see ``agents_workspace.secrets``)."""
+    from .secrets import resolve_secret as _resolve
 
-    Files are flat ``{"KEY": "value"}`` objects; first non-empty string wins.
-    A workspace-level value beats the host default, which beats the exported
-    env var. Returns "" when the key is nowhere set.
-    """
-    ws = ws or Workspace.from_env()
-    for path in (ws.secrets, ws.host.secrets):
-        val = _json_dict(path).get(key)
-        if isinstance(val, str) and val:
-            return val
-    return str((os.environ if env is None else env).get(key) or "")
+    return _resolve(key, ws=ws, env=env, scope=scope, host=host)
 
 
 def current() -> Workspace:
