@@ -6,8 +6,8 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 
 | Level | Where | Selected by | Contains |
 | --- | --- | --- | --- |
-| **Host** | `AGENTS_HOST_DIR`, default `~/.agents` *(decided (Felix, 10.11.): '.agents' stays, level named 'Host')*, container `/data/.agents` | one `serve` per host | infra only: `keys/` (global, Felix), `secrets.json` (global; optional `<ws>/secrets.json` override, decided (Klanker, technical, 10.11.) D-secrets), `run/` (`serve.pid`, prompt, locks, `run/voice_inbox/` spool), `cache/`, `logs/`, `clients/`, `providers/` (harness/relay provider manifests), `<host>/agents.json` (decided (Klanker, technical, 10.11.) D-config), `<host>/mcp.json` (decided (Klanker, technical, 10.11.) D-mcp-level), `<host>/voice.json` (TTS provider config incl. keys — host-level like mcp.json, decided (Devin, technical, 21.11.)), `host_paths.json`, `AGENTS.md`/`CLAUDE.md` root inject targets (C62), browser profile (decided (Klanker, technical, 10.11.) D-browser-profile), `archive/` + `conflicts/<stamp>/` (migrate output, decided (Devin, technical, 21.11.)). **No** host-wide `memory/` or `skills/` (decided Felix 10.11. 19:31, D-host-layer). decided (Felix, 10.11.): `identity.json` -> `<host>/users.json` (alias->user, + DID). decided (Felix, 10.11.): identity.json moves to agents-keys; traces reads via keys, and without keys uses its own local ID. Later cross-workspace overview is a read-only search with explicit grant, not a storage level. |
-| **Workspace** | `<host>/workspaces/<id>/` | `AGENTS_WORKSPACE=<id>` (id only), passed per call | shared `memory/` for all its personas (optional private notes); `skills/ modules/ rules/ schedules/ routine-runs/ relay/ traces/ calendar.json store.db workspace.json personas/` `work/` (API default workdir) (+ `content/`, browser *artifacts* in ws, decided (Klanker, technical, 10.11.) D-browser-profile); optional `<ws>/secrets.json` and `<ws>/mcp.json` overlay; `sync_config.json` at ws (decided (Klanker, technical, 10.11.) D-sync-config-level). decided (Felix, 10.11.): `memory/` = knowledge only, `memory/rules/HARD.md` + `*.mdc` together in `<ws>/rules/`; new `<ws>/members.json` (user+role); `identity.json` moves off the workspace to `<host>/users.json`. |
+| **Host** | `AGENTS_HOST_DIR`, default `~/.agents` *(decided (Felix, 10.11.): '.agents' stays, level named 'Host')*, container `/data/.agents` | one `serve` per host | infra only: `keys/` (`*.ed25519`, `vapid.json`), `secrets/` (`host.json`, `ws-<id>.json`, `push.json`, `0700`/`0600`), `run/` (`serve.json`, `approvals/`, `prompts/`, `run/voice_inbox/`), `cache/`, `logs/` (`serve.log`), `clients/` (`desktop/`, `telegram.json`, `remotes.json`), `providers/`, `approval-allowlist.json`, `<host>/agents.json`, `<host>/mcp.json` + `<host>/mcp/ws-<id>.json`, `<host>/voice.json` (config only, keys in vault), `host_paths.json`, `AGENTS.md`/`CLAUDE.md` root inject targets (C62), `browser/sessions/<name>` (D-browser-profile), `archive/` (incl. `archive/unclassified/`) + `conflicts/<stamp>/` (migrate output). **No** host-wide `memory/` or `skills/` (D-host-layer). `<host>/users.json` (alias->user, + DID). |
+| **Workspace** | `<host>/workspaces/<id>/` | `AGENTS_WORKSPACE=<id>` (id only), passed per call | lazy `init()` creates `workspace.json` only; domains materialize on write (`memory/`, `skills/`, `modules/`, `rules/`, `schedules/`, `routine-runs/`, `relay/`, `traces/`, `calendar.json`, `store.db`, `personas/`, `work/`, `content/`, browser *artifacts*); ephemeral `run/{delegates,procs}/` (never synced); optional untrusted `<ws>/mcp.json` overlay (no `${ENV}` expansion); `sync_config.json` (no plaintext token); `<ws>/members.json` (user+role). Zero secrets inside `<ws>/`. |
 | **Persona** | `<ws>/personas/<id>/persona.json` | `AGENTS_PERSONA=<id>` | personas are equal, no hierarchy (a role e.g. CoS = a persona with a role description); first persona `default` is created with the workspace (renamable); inbox + explicit task ownership for handoffs; optional private notes; manifest + prompt addition (P2) |
 | **Session** | `<ws>/personas/<p>/sessions/<ses>` | API/CLI only | id = ULID (decided (Klanker, technical, 10.11.) D-session-id); key = workspace + user + persona; `channel` and `workdir` are attributes (P2) |
 | *workdir* | any directory | `AGENTS_WORKDIR`, `--workdir` | NOT a level: cwd attribute of a session |
@@ -15,20 +15,20 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 ```
 ~/.agents/                      # Host (AGENTS_HOST_DIR; container /data/.agents)
                                 # decided (Felix, 10.11.): '.agents' stays, level named 'Host'
-  keys/  secrets.json  run/  cache/  logs/  clients/  host_paths.json
-  agents.json  mcp.json         # D-config, D-mcp-level (Klanker technical)
-  providers/  voice.json        # provider manifests; TTS config (host-level keys)
+  keys/  secrets/               # secrets/{host,ws-<id>}.json (0700/0600); keys/*.ed25519, vapid.json
+  run/  cache/  logs/  clients/ # run/serve.json, run/approvals/, clients/desktop/, host_paths.json
+  agents.json  mcp.json  mcp/   # mcp/ws-<id>.json host overlays; approval-allowlist.json
+  providers/  voice.json        # provider manifests; TTS config (keys live in vault)
   run/voice_inbox/              # transient speech spool
   users.json                    # decided (Felix, 10.11.) (from identity.json; alias->user, + DID)
   AGENTS.md  CLAUDE.md          # root inject targets (C62)
-  browser/                      # profile on host (D-browser-profile); artifacts stay in the workspace
-  archive/  conflicts/<stamp>/  # migrate output: backups + quarantined collisions
-  workspaces/<ws>/              # AGENTS_WORKSPACE=<id>; shared memory for all personas
+  browser/sessions/<name>       # profile on host (D-browser-profile); artifacts stay in the workspace
+  archive/  conflicts/<stamp>/  # migrate/unclassified output & gc --older-than targets
+  workspaces/<ws>/              # AGENTS_WORKSPACE=<id>; lazy workspace.json only on init
     memory/                     # decided (Felix, 10.11.): knowledge only (HARD.md leaves for rules/)
     skills/ modules/ rules/ schedules/ routine-runs/
-    relay/ traces/ calendar.json store.db workspace.json work/
-    secrets.json  mcp.json      # optional overrides/overlays
-    members.json                # decided (Felix, 10.11.) (user+role)
+    relay/ traces/ run/{delegates,procs}/ calendar.json store.db workspace.json work/
+    mcp.json  members.json      # untrusted ws mcp overlay (no ${ENV}); members.json
     personas/<p>/               # AGENTS_PERSONA=<id>; equal; first is 'default'; optional private notes; inbox
       persona.json
       sessions/<ses>            # ULID id; key ws+user+persona
@@ -38,14 +38,14 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 1. Names ending in `_DIR` are directory paths; names without suffix are ids. File-path vars use the `_FILE` suffix: `AGENTS_USERS_FILE` (alias `AGENTS_IDENTITY_PATH`, points to `<host>/users.json`), `AGENTS_KNOWN_DIDS_FILE` (alias `AGENTS_KNOWN_DIDS`), `AGENTS_MCP_CONFIG_FILE` (alias `AGENTS_MCP_CONFIG`), `AGENTS_MCP_CACHE_FILE` (alias `AGENTS_MCP_CACHE`), `AGENTS_SYNC_CONFIG_FILE` (alias `AGENTS_SYNC_CONFIG`) — alias 1 release each (decided (Klanker, technical, 10.11.) D-file-suffix).
 2. decided (Felix, 10.11.): host folder name — '.agents' stays, level named 'Host' in docs/env (`AGENTS_HOST_DIR`). The term is not `.klanker`. The term "home" disappears from code and output.
 3. All aliases last 1 release (decided (Klanker, technical, 10.11.) D-alias-policy): `AGENTS_HOME` → `AGENTS_HOST_DIR` completed the cycle and is now removed entirely (unreleased suite, coordinated rename). Same policy for every other alias.
-4. Removed/migrated: `AGENTS_WORKSPACE_ROOT`, `AGENTS_WORKSPACE_DIR` (-> `AGENTS_WORKDIR`), `AGENTS_WORKSPACES_DIR`, `AGENTS_DIR`, `~/.agents-workspaces`, `~/.agents-relay`, `~/.klanker/daemon.pid`.
+4. Removed/migrated: `AGENTS_WORKSPACE_ROOT`, `AGENTS_WORKSPACE_DIR` (-> `AGENTS_WORKDIR`), `AGENTS_WORKSPACES_DIR`, `AGENTS_DIR`, `~/.agents-workspaces`, `~/.agents-relay`, `~/.klanker`.
 5. One `serve` per host. The workspace is passed explicitly per call; serve never switches `os.environ`. Env vars are only for child processes and at CLI entry.
 6. Domain overrides (`AGENTS_MEMORY_DIR` etc.) remain only for test/debug, apply only to the workspace chosen at CLI start, and emit a warning; serve ignores them per call (decided (Klanker, technical, 10.11.) D-domain-overrides).
-7. Keys stay global on the host (Felix). Provider secrets are global + optional `<ws>/secrets.json` override (decided (Klanker, technical, 10.11.) D-secrets).
+7. Keys stay global on the host (`<host>/keys/`). Host-infra secrets lock `ENV > /run/secrets > keyring > host.json`; workspace/provider secrets default `ws-<id>.json > keyring > host.json > ENV` (`AGENTS_SECRETS_ORDER=env-first` flips).
 8. Host is infra only (keys, secrets, run, cache, logs). No host-wide memory/skills (decided Felix 10.11. 19:31, D-host-layer). Later: read-only cross-workspace search with explicit grant, not a storage level. Workspace memory is shared by all its personas; a persona may have optional private notes.
 9. API: `/v1/workspaces/{ws}/personas/{p}/sessions/{s}`; `/v1/turn` takes `{workspace, persona, session, workdir}` (ids only for workspace/persona).
 10. agents-docs is archived and out of the plan (remove leftovers).
-11. First start creates a normal workspace `default` (renamable/deletable, no special role). If no workspace is given: use the only existing workspace; if several exist, error (D-default-ws, decided Felix 10.11. 19:31).
+11. First start creates a normal workspace `default` (renamable/deletable, no special role). `Host.select_workspace(..., strict=False)` uses `agents.json -> default_workspace` or existing `default` when several exist; `strict=True` raises when ambiguous.
 12. If no workdir is given: CLI = cwd, API = `<ws>/work` (D-workdir-default, decided Felix 10.11. 19:31).
 13. Personas are equal (no hierarchy). A role (e.g. CoS) is a persona with a role description. First persona `default` is created with the workspace. Explicit handoffs: inbox per persona + clear task ownership (D-persona-default, P2, decided Felix 10.11. 19:31).
 

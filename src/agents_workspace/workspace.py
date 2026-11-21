@@ -349,6 +349,18 @@ class Host:
         return self.dir / "mcp.json"
 
     @property
+    def mcp_dir(self) -> Path:
+        return self.dir / "mcp"
+
+    @property
+    def providers(self) -> Path:
+        return self.dir / "providers"
+
+    @property
+    def approval_allowlist(self) -> Path:
+        return self.dir / "approval-allowlist.json"
+
+    @property
     def host_paths(self) -> Path:
         return self.dir / "host_paths.json"
 
@@ -797,6 +809,25 @@ class Workspace:
         return self.dir / "browser"
 
     @property
+    def browser_profile(self) -> str:
+        """Host browser session profile name for this workspace."""
+        val = str(_read_meta(self.dir).get("browser_profile") or "").strip()
+        return val or "default"
+
+    @property
+    def run(self) -> Path:
+        """Ephemeral runtime dir under the workspace (never synced)."""
+        return self.dir / "run"
+
+    @property
+    def delegates(self) -> Path:
+        return self.run / "delegates"
+
+    @property
+    def procs(self) -> Path:
+        return self.run / "procs"
+
+    @property
     def claude(self) -> Path:
         return Path.home() / ".claude"
 
@@ -855,6 +886,7 @@ class Workspace:
             "sync_config": self.sync_config,
             "mcp": self.mcp_json,
             "calendar": self.calendar,
+            "run": self.run,
         }
         if key in table:
             return table[key]
@@ -869,7 +901,8 @@ class Workspace:
         return self
 
     def init(self, *, label: str = "", default_persona: str = "") -> "Workspace":
-        self.ensure()
+        """Write ``workspace.json`` lazily without pre-creating empty domain dirs."""
+        self.dir.mkdir(parents=True, exist_ok=True)
         meta = {}
         if self.workspace_file.is_file():
             try:
@@ -1043,10 +1076,10 @@ def denied_paths(ws: Workspace) -> list[Path]:
         host.secrets,
         host.secrets_dir,
         host.mcp_json,
-        host.dir / "mcp",
+        host.mcp_dir,
         host.agents_json,
         host.users_file(),
-        host.dir / "approval-allowlist.json",
+        host.approval_allowlist,
         ws.secrets,
         ws.members,
     ]

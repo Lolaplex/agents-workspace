@@ -306,8 +306,33 @@ class TestLifecycle(unittest.TestCase):
     def test_ensure_creates_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = Host.open(tmp).create("a")
+            self.assertTrue(ws.workspace_file.is_file())
+            self.assertTrue((ws.personas / "default" / "persona.json").is_file())
+            # Strict lazy: domain dirs are not materialized until written or ensured.
+            for lazy_dir in (ws.memory, ws.traces, ws.work, ws.skills):
+                self.assertFalse(lazy_dir.exists(), lazy_dir.name)
+            ws.ensure()
             for name in ("memory", "traces", "personas", "work"):
                 self.assertTrue(ws.domain(name).is_dir(), name)
+
+    def test_canonical_host_and_ws_paths(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            self.assertEqual(host.approval_allowlist, host.dir / "approval-allowlist.json")
+            self.assertEqual(host.providers, host.dir / "providers")
+            self.assertEqual(host.mcp_dir, host.dir / "mcp")
+            ws = host.create("a")
+            self.assertEqual(ws.run, ws.dir / "run")
+            self.assertEqual(ws.delegates, ws.dir / "run" / "delegates")
+            self.assertEqual(ws.procs, ws.dir / "run" / "procs")
+            self.assertEqual(ws.domain("run"), ws.run)
+            self.assertEqual(ws.browser_profile, "default")
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["browser_profile"] = "work-profile"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(ws.browser_profile, "work-profile")
 
     def test_init_writes_and_reloads_meta(self):
         with tempfile.TemporaryDirectory() as tmp:

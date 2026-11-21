@@ -16,60 +16,70 @@ workdir any directory               AGENTS_WORKDIR         (attribute, not a lev
 ```
 
 Host infra (all resolved, not user-configurable):
-`keys/  secrets.json  run/  cache/  logs/  clients/  providers/
-users.json  agents.json  mcp.json  voice.json  host_paths.json
+`keys/  secrets/{host,ws-<id>}.json  run/{serve.json,approvals/,...}  cache/  logs/  clients/{desktop,telegram.json,remotes.json}  providers/
+mcp.json  mcp/ws-<id>.json  approval-allowlist.json  users.json  agents.json  voice.json  host_paths.json
 AGENTS.md  CLAUDE.md            # root inject targets (C62)
-browser/                        # profiles + managed binaries (D-browser-profile)
-archive/  conflicts/<stamp>/    # migrate output
+browser/sessions/<name>         # profiles + managed binaries (D-browser-profile)
+archive/{...,unclassified/}  conflicts/<stamp>/  # migrate & quarantine output
 workspaces/.trash/              # deleted-ws archive`
 
-Ws data: 12 dir domains (`memory rules skills modules schedules traces
-routine-runs relay personas content work browser`) + file domains
-(`config secrets store workspace members sync_config mcp calendar`).
+Ws data (strict lazy `init()` writes only `workspace.json`; domains
+materialize on write): 12 dir domains (`memory rules skills modules
+schedules traces routine-runs relay personas content work browser`) +
+`run/{delegates,procs}` (ephemeral, never synced) + config files (`config
+store workspace members sync_config mcp calendar`). No secrets live inside `<ws>/`.
 
 ### 1.2 Selection semantics
 
-- `Workspace.from_env()`: `AGENTS_WORKSPACE` set → must exist (else error);
-  unset → 0 ws = create `default`, 1 ws = use it, >1 ws = **error**.
+- `Host.select_workspace(strict=False)`: `AGENTS_WORKSPACE` set → must exist
+  (else error); unset → 0 ws = create `default`, 1 ws = use it, >1 ws =
+  `agents.json -> default_workspace` or existing `default` (with
+  `strict=True` raising `ValueError`).
 - `Host.workspace(id)` never reads env; `Host.from_env()` only `AGENTS_HOST_DIR`.
-- Entry point pins the workspace once; children get `ws.env()`.
+- Entry point pins the workspace once; children receive role-scoped `ws.env()`.
 
-### 1.3 Env hygiene (the anti-leak system)
+### 1.3 Env hygiene & roles (the anti-leak system)
 
-`Workspace.env()` pops **every** var the contract owns (~30 keys:
-canonical + all deprecated aliases + `AGENTS_HOME` + domain overrides +
-`AGENTS_PERSONA` + `AGENTS_BROWSER_*` + file vars) before setting this
-workspace's values. A parent can never leak a workspace/persona/domain
-into a child turn. This is the single mechanism that keeps parallel
-workspaces from biting each other — no other guard is needed.
+`Workspace.env(..., role="default"|"turn"|"tool"|"acp"|"container")` pops **every**
+owned resolver key before setting this workspace's paths, strips infra secrets
+(`INFRA_SECRET_KEYS`, `AGENTS_SYNC_TOKEN`) from non-default roles, isolates
+provider keys by `provider_key_env` on turns/containers, and strips LLM & VCS
+tokens on `"tool"` and `"acp"` boundaries.
 
 ### 1.4 Domain overrides = test/debug only
 
 `AGENTS_MEMORY_DIR` & friends apply only to the entry-selected ws, emit
 `UserWarning`, never apply to `Host.workspace()`. Contract level C11.
 
-### 1.5 Secrets
+### 1.5 Secrets (Host Secret Vault)
 
-`resolve_secret(key, ws)`: `<ws>/secrets.json` → `<host>/secrets.json` → env.
-File beats env by design (D-secrets).
+Secrets live host-side under `<host>/secrets/` (`0700` dir, `0600` files:
+`host.json`, `ws-<id>.json`), optionally backed by OS keyring or `/run/secrets`:
+- **Host infra** (`RELAY_*`, `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, etc.):
+  always `ENV > /run/secrets > keyring > host.json` (never workspace files).
+- **Provider / workspace keys**: default `ws-<id>.json > keyring > host.json > ENV`,
+  flipped to `ENV > /run/secrets > ws-<id>.json > ...` via `AGENTS_SECRETS_ORDER=env-first`.
+- `expand_secrets(..., trusted=True)` expands `${VAR}` only in host-owned
+  `<host>/mcp.json` and `<host>/mcp/ws-<id>.json` (never untrusted `<ws>/mcp.json`).
 
 ### 1.6 Identity / membership
 
 `<host>/users.json` (DID users, agents-keys owns) —
-`<ws>/members.json` (user+role, `members.py`) —
+`<ws>/members.json` (user+role, `members.py`, denied to terminal tools) —
 `<ws>/personas/<p>/` (`persona.json`, sessions, `inbox.py` task handoffs).
 
 ### 1.7 Lifecycle ops
 
 `create / delete` (→ `.trash`, `--hard` removes, refuses env-selected ws),
-`migrate` (legacy→layout; merge-not-abort; archive; conflicts quarantine;
-rollback log), CLI `create|list|show|env|info|path|migrate|delete`.
+`migrate` (legacy→layout; merge-not-abort; `archive/unclassified/`; conflicts
+quarantine; rollback log), `secrets set|unset|list`, `doctor`, `gc --older-than`,
+CLI `create|list|show|env|info|path|migrate|delete|secrets|doctor|gc`.
 
 ### 1.8 Explicitly NOT owned
 
-- No daemon, no network, no keyring, no persona logic.
-- `~/.klanker` — app registry (`instances/*/instance.json`, `relay-secret`,
-  `settings.json`). App config ≠ suite data; boundary is correct.
+- No daemon, no network, no persona orchestration logic inside this package.
+- Host desktop app state lives at `<host>/clients/desktop/` (`instances.json` /
+  `instances/`, `settings.json`); legacy `~/.klanker` is retired and migrated.
 - Repo-local `<repo>/.agents/` — project memory owned by agents-memory.
 
 ## 2. What it could additionally decide (proposal backlog)
