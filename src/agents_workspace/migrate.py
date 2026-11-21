@@ -25,13 +25,14 @@ _WS_FILES = (
     "workspace.json",
     ".tombstones.json",
     "sync_config.json",
-    "AGENTS.md",
-    "CLAUDE.md",
     ".env",
 )
 
 # Legacy entries that stay on (or move to) host infrastructure.
-_HOST_DIRS = ("keys", "run", "cache", "logs", "clients", "browser")
+# "archive"/"conflicts" are produced by migration runs themselves; listing
+# them here keeps later runs from sweeping them into a workspace.
+_HOST_DIRS = ("keys", "run", "cache", "logs", "clients", "browser",
+              "providers", "archive", "conflicts")
 _HOST_FILES = (
     "secrets.json",
     "agents.json",
@@ -39,13 +40,17 @@ _HOST_FILES = (
     "users.json",
     "identity.json",
     "mcp.json",
+    "voice.json",
     "known-dids.jsonl",
+    # root injection targets stay host-level (NAMING C62)
+    "AGENTS.md",
+    "CLAUDE.md",
 )
 # Legacy browser/chromium profile dirs stay host-level (they are profiles,
 # not the new <ws>/browser artifacts domain).
 _PROFILE_PREFIXES = ("browser-", "browser_", "chromium")
 # Legacy dirs that move under a host dir instead of staying top-level.
-_HOST_DIR_REMAP = {"repl": "clients"}
+_HOST_DIR_REMAP = {"repl": "clients", "voice_inbox": "run"}
 # Legacy dirs that merge into a workspace domain (old aliases for the domain).
 _WS_DIR_REMAP = {"harness-content": "content"}
 # Legacy host files that move into a host subdir.
@@ -58,12 +63,17 @@ _REGENERABLE = {"mcp-tools-cache.json"}
 
 _EXT_WS_GLOBS = (".agents-workspaces", ".agents-relay", ".client", ".klanker")
 
+# Names that mark disposable or archivable leftovers at the host root.
+_ARCHIVE_MARK = ".bak-"        # memory.bak-<ts>, rules.bak-<tag>, ...
+_STALE_EMPTY_DIRS = ("workspace",)  # pre-workspaces/ singular leftover
+
 
 @dataclass
 class Move:
     src: Path
     dst: Path
     kind: str  # "ws" | "host" | "external" | "delete" | "merge-users"
+               # executor-generated: "merge" (leaf) | "conflict" (quarantined)
     # populated during execution for kind == "merge-users"
     merge_src_backup: str = ""
     merge_backup: str = ""
@@ -99,6 +109,14 @@ def _merge_users_file(m: Move) -> None:
                    encoding="utf-8")
     os.replace(tmp, m.dst)
     m.src.unlink()
+
+
+def _pid_file_live(path: Path) -> bool:
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pid > 0 and _pid_alive(pid)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -191,10 +209,13 @@ def plan_migration(host: Host, ws_id: str = "default",
             moves.append(Move(src, dst, "host"))
     prompt = host_dir / "klanker_prompt.txt"
     if prompt.is_file():
-        moves.append(
-            Move(prompt, host_dir / "run" / f"klanker_prompt_{ws_id}.txt", "host"))
+        dst = host_dir / "run" / f"klanker_prompt_{ws_id}.txt"
+        # regenerated on every serve; a stale copy is deleted, not kept
+        moves.append(Move(prompt, Path("") if dst.is_file() else dst,
+                          "delete" if dst.is_file() else "host"))
 
     # 4. external roots
+    archive = host_dir / "archive"
     home = home or Path.home()
     for pattern in _EXT_WS_GLOBS:
         ext = home / pattern
@@ -209,20 +230,51 @@ def plan_migration(host: Host, ws_id: str = "default",
             moves.append(Move(ext, host_dir / "clients", "external"))
         elif pattern == ".klanker" and ext.is_dir():
             pid_file = ext / "daemon.pid"
-            if pid_file.is_file():
-                try:
-                    pid = int(pid_file.read_text().strip())
-                except (OSError, ValueError):
-                    pid = -1
-                if pid <= 0 or not _pid_alive(pid):
-                    moves.append(Move(pid_file, Path(""), "delete"))
+            if pid_file.is_file() and not _pid_file_live(pid_file):
+                moves.append(Move(pid_file, Path(""), "delete"))
+            # Legacy per-instance payload: workspaces merge into the host
+            # workspaces tree; everything else (except the registry's
+            # instance.json, relay-secret and settings.json, which still
+            # live in ~/.klanker) is archived under <host>/archive/klanker/.
+            inst_root = ext / "instances"
+            if inst_root.is_dir():
+                for inst in sorted(inst_root.iterdir()):
+                    if not inst.is_dir():
+                        continue
+                    for entry in sorted(inst.iterdir()):
+                        if entry.name == "instance.json":
+                            continue
+                        if entry.name == "workspaces" and entry.is_dir():
+                            for ws in sorted(entry.iterdir()):
+                                if ws.is_dir():
+                                    moves.append(Move(
+                                        ws,
+                                        host_dir / "workspaces" / ws.name,
+                                        "external"))
+                            moves.append(Move(entry, Path(""), "delete"))
+                        elif entry.name == "daemon.pid":
+                            if not _pid_file_live(entry):
+                                moves.append(Move(entry, Path(""), "delete"))
+                        else:
+                            moves.append(Move(
+                                entry,
+                                archive / "klanker" / inst.name / entry.name,
+                                "external"))
 
-    # 5. catch-all: any other top-level entry is workspace data
+    # 5. catch-all: backups archive, stale empties die, rest is ws data
     planned_srcs = {m.src for m in moves}
     for entry in sorted(host_dir.iterdir()):
         if entry.name == "workspaces" or entry in planned_srcs:
             continue
-        moves.append(Move(entry, ws_dir / entry.name, "ws"))
+        if _ARCHIVE_MARK in entry.name or entry.name.endswith(".bak"):
+            moves.append(Move(entry, archive / entry.name, "host"))
+        elif entry.name in _STALE_EMPTY_DIRS and entry.is_dir():
+            if any(entry.iterdir()):
+                moves.append(Move(entry, archive / entry.name, "host"))
+            else:
+                moves.append(Move(entry, Path(""), "delete"))
+        else:
+            moves.append(Move(entry, ws_dir / entry.name, "ws"))
 
     # no-op moves (src already lives at dst on this host)
     moves = [m for m in moves
@@ -235,18 +287,68 @@ def _norm(path: Path) -> str:
 
 
 def _conflicts(moves: Iterable[Move]) -> list[Move]:
-    moves = list(moves)
-    skip = ("delete", "merge-users")
-    out = [m for m in moves if m.kind not in skip and m.dst.exists()]
-    seen: dict[str, Move] = {}
-    for m in moves:
-        if m.kind in skip:
+    """Moves whose dst already exists — merged at execution, never fatal."""
+    return [m for m in list(moves)
+            if m.kind not in ("delete", "merge-users") and m.dst.exists()]
+
+
+def _conflict_path(conflicts_root: Path, host_dir: Path, dst: Path,
+                   name: str) -> Path:
+    """Quarantine path for a colliding entry, mirroring the dst layout."""
+    try:
+        rel = dst.relative_to(host_dir)
+    except ValueError:
+        rel = Path(dst.name)
+    base = conflicts_root / rel / name
+    final = base
+    n = 1
+    while final.exists():
+        final = base.with_name(f"{base.name}.{n}")
+        n += 1
+    return final
+
+
+def _merge_tree(src: Path, dst: Path, conflicts_root: Path,
+                host_dir: Path, done: List[Move]) -> None:
+    """Merge src dir into dst: free entries move, identical files are
+    dropped, colliding files/dirs move to <host>/conflicts/<stamp>/."""
+    for child in sorted(src.iterdir()):
+        target = dst / child.name
+        if child.is_dir() and target.is_dir():
+            _merge_tree(child, target, conflicts_root, host_dir, done)
             continue
-        key = _norm(m.dst)
-        if key in seen:
-            out.append(m)
-        seen[key] = m
-    return out
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(child), str(target))
+            done.append(Move(child, target, "merge"))
+            continue
+        if child.is_file() and target.is_file() \
+                and child.read_bytes() == target.read_bytes():
+            child.unlink()
+            done.append(Move(child, Path(""), "delete"))
+            continue
+        cpath = _conflict_path(conflicts_root, host_dir, dst, child.name)
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(child), str(cpath))
+        done.append(Move(child, cpath, "conflict"))
+    src.rmdir()
+
+
+def _resolve_collision(m: Move, conflicts_root: Path, host_dir: Path,
+                       done: List[Move]) -> None:
+    """dst exists: merge trees, drop byte-identical dupes, quarantine the rest."""
+    if m.src.is_dir() and m.dst.is_dir():
+        _merge_tree(m.src, m.dst, conflicts_root, host_dir, done)
+        return
+    if m.src.is_file() and m.dst.is_file() \
+            and m.src.read_bytes() == m.dst.read_bytes():
+        m.src.unlink()
+        done.append(Move(m.src, Path(""), "delete"))
+        return
+    cpath = _conflict_path(conflicts_root, host_dir, m.dst.parent, m.src.name)
+    cpath.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(m.src), str(cpath))
+    done.append(Move(m.src, cpath, "conflict"))
 
 
 def already_migrated(host: Host) -> bool:
@@ -269,11 +371,12 @@ def _lock(host: Host):
 
 def execute_migration(moves: list[Move], host: Host, *,
                       dry_run: bool = False) -> Optional[Path]:
-    """Apply the plan. Returns the JSON log path (or None for dry-run)."""
-    conflicts = _conflicts(moves)
-    if conflicts:
-        lines = "\n".join(f"  {m.src} -> {m.dst} (exists)" for m in conflicts)
-        raise RuntimeError(f"destination exists, aborting before any move:\n{lines}")
+    """Apply the plan. Returns the JSON log path (or None for dry-run).
+
+    Existing destinations merge instead of aborting: directory trees merge
+    leaf-by-leaf, byte-identical duplicates are dropped, and anything still
+    colliding lands under ``<host>/conflicts/<stamp>/`` for inspection.
+    """
     if dry_run or not moves:
         return None
 
@@ -282,12 +385,16 @@ def execute_migration(moves: list[Move], host: Host, *,
         host.logs.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         log_path = host.logs / f"migrate-{stamp}.json"
+        conflicts_root = host.dir / "conflicts" / stamp
         done: list[Move] = []
         try:
             for m in moves:
                 if m.kind == "delete":
                     if m.src.is_dir():
-                        m.src.rmdir()
+                        try:
+                            m.src.rmdir()
+                        except OSError:
+                            pass  # non-empty: children stayed behind
                     else:
                         m.src.unlink(missing_ok=True)
                     done.append(m)
@@ -295,6 +402,9 @@ def execute_migration(moves: list[Move], host: Host, *,
                 if m.kind == "merge-users":
                     _merge_users_file(m)
                     done.append(m)
+                    continue
+                if m.dst.exists():
+                    _resolve_collision(m, conflicts_root, host.dir, done)
                     continue
                 m.dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(m.src), str(m.dst))
@@ -372,11 +482,11 @@ def run_cli(host: Host, *, ws_id: str = "default", dry_run: bool = False,
             print(f"{verb} {m.src} -> {m.dst}")
     conflicts = _conflicts(moves)
     if conflicts:
-        print("conflicts (destination exists):")
+        print("will merge (colliding files -> <host>/conflicts/<stamp>/):")
         for m in conflicts:
             print(f"  {m.src} -> {m.dst}")
     if dry_run:
-        return 1 if conflicts else 0
+        return 0
     if not yes and sys.stdin.isatty():
         answer = input("apply? [y/N] ").strip().lower()
         if answer != "y":

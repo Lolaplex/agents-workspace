@@ -101,18 +101,42 @@ class TestMigration(unittest.TestCase):
         data = json.loads(log.read_text(encoding="utf-8"))
         self.assertGreater(len(data["moves"]), 0)
 
-    def test_conflict_aborts_with_zero_movement(self):
+    def test_conflict_merges_into_existing_ws_dir(self):
         _legacy_tree(self.host_dir, self.home)
         blocker = self.host_dir / "workspaces" / "default" / "memory"
         blocker.mkdir(parents=True)
         (blocker / "keep.txt").write_text("keep", encoding="utf-8")
-        before = _snapshot(self.host_dir)
         moves = plan_migration(self.host, home=self.home)
-        with self.assertRaises(RuntimeError):
-            execute_migration(moves, self.host)
-        self.assertEqual(before, _snapshot(self.host_dir))
-        self.assertTrue((self.host_dir / "memory").is_dir())
+        execute_migration(moves, self.host)
+        # free entries merge in, pre-existing ws content stays
         self.assertTrue((blocker / "keep.txt").is_file())
+        self.assertTrue((blocker / "memory-file.txt").is_file())
+        self.assertFalse((self.host_dir / "memory").exists())
+
+    def test_conflicting_file_is_quarantined(self):
+        _legacy_tree(self.host_dir, self.home)
+        blocker = self.host_dir / "workspaces" / "default"
+        blocker.mkdir(parents=True)
+        (blocker / "calendar.json").write_text('{"new":1}', encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertEqual(
+            (blocker / "calendar.json").read_text("utf-8"), '{"new":1}')
+        quarantined = list(
+            (self.host_dir / "conflicts").rglob("calendar.json"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(
+            quarantined[0].read_text("utf-8"), "{}")
+
+    def test_identical_file_is_dropped_not_quarantined(self):
+        _legacy_tree(self.host_dir, self.home)
+        blocker = self.host_dir / "workspaces" / "default"
+        blocker.mkdir(parents=True)
+        (blocker / "calendar.json").write_text("{}", encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertFalse((self.host_dir / "calendar.json").exists())
+        self.assertFalse((self.host_dir / "conflicts").exists())
 
     def test_rollback_restores_byte_identical(self):
         _legacy_tree(self.host_dir, self.home)
@@ -125,15 +149,19 @@ class TestMigration(unittest.TestCase):
         self.assertFalse((self.host_dir / "users.json").exists())
         self.assertTrue((self.host_dir / "identity.json").is_file())
 
-    def test_relay_collision_aborts(self):
-        # host relay/ + ~/.agents-relay both target <ws>/relay -> abort
+    def test_relay_collision_merges(self):
+        # host relay/ + ~/.agents-relay both target <ws>/relay -> merge
         (self.host_dir / "relay").mkdir(parents=True)
+        (self.host_dir / "relay" / "a.txt").write_text("a", encoding="utf-8")
         (self.home / ".agents-relay").mkdir(parents=True)
+        (self.home / ".agents-relay" / "b.txt").write_text("b", encoding="utf-8")
         moves = plan_migration(self.host, home=self.home)
-        with self.assertRaises(RuntimeError):
-            execute_migration(moves, self.host)
-        self.assertTrue((self.host_dir / "relay").is_dir())
-        self.assertTrue((self.home / ".agents-relay").is_dir())
+        execute_migration(moves, self.host)
+        ws_relay = self.host_dir / "workspaces" / "default" / "relay"
+        self.assertTrue((ws_relay / "a.txt").is_file())
+        self.assertTrue((ws_relay / "b.txt").is_file())
+        self.assertFalse((self.host_dir / "relay").exists())
+        self.assertFalse((self.home / ".agents-relay").exists())
 
     def test_second_run_reports_already_migrated(self):
         _legacy_tree(self.host_dir, self.home)
@@ -254,6 +282,46 @@ class TestMigration(unittest.TestCase):
         self.assertTrue((ws / "ab" / "body.txt").is_file())
         self.assertTrue((ws / "same.txt").is_file())
         self.assertFalse((self.host_dir / "harness-content").exists())
+
+    def test_bak_dirs_archive_and_empty_workspace_dir_dies(self):
+        self.host_dir.mkdir(parents=True)
+        (self.host_dir / "memory.bak-20990101T000000Z").mkdir(parents=True)
+        (self.host_dir / "memory.bak-20990101T000000Z" / "f.md").write_text(
+            "x", encoding="utf-8")
+        (self.host_dir / "workspace").mkdir()
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertTrue(
+            (self.host_dir / "archive" / "memory.bak-20990101T000000Z"
+             / "f.md").is_file())
+        self.assertFalse(
+            (self.host_dir / "memory.bak-20990101T000000Z").exists())
+        self.assertFalse((self.host_dir / "workspace").exists())
+
+    def test_klanker_instance_payload_merges_and_archives(self):
+        self.host_dir.mkdir(parents=True)
+        inst = self.home / ".klanker" / "instances" / "default"
+        ws_dir = inst / "workspaces" / "default"
+        sessions = ws_dir / "personas" / "default" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "ses_1.json").write_text("{}", encoding="utf-8")
+        (ws_dir / "workspace.json").write_text("{}", encoding="utf-8")
+        (inst / "instance.json").write_text("{}", encoding="utf-8")
+        (inst / "users.json").write_text("{}", encoding="utf-8")
+        (inst / "daemon.pid").write_text("999999999", encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        ws = self.host_dir / "workspaces" / "default"
+        self.assertTrue(
+            (ws / "personas" / "default" / "sessions" / "ses_1.json").is_file())
+        self.assertTrue((ws / "workspace.json").is_file())
+        # registry file stays; payload archived; dead pid deleted
+        self.assertTrue((inst / "instance.json").is_file())
+        self.assertTrue(
+            (self.host_dir / "archive" / "klanker" / "default"
+             / "users.json").is_file())
+        self.assertFalse((inst / "daemon.pid").exists())
+        self.assertFalse((inst / "workspaces").exists())
 
     def test_stale_regenerable_cache_is_deleted(self):
         self.host_dir.mkdir(parents=True)
