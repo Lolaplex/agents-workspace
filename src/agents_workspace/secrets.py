@@ -426,6 +426,110 @@ def _check_perms(issues: list[dict[str, str]], path: Path, expect_mask: int) -> 
         )
 
 
+# Declarative consumer secret checks. A check is ``{"scope": "host"|"workspace",
+# "file": <rel path>, "severity", "message", optional "key": <dotted json
+# path>}``; without ``key`` mere file existence is flagged, with ``key`` a
+# truthy value at that path is. Consumers self-register extra checks by
+# dropping ``<host>/doctor.d/<name>.json`` (a check list or ``{"checks": [...]}``)
+# at install time, so new/renamed secret files never need a patch here.
+_BUILTIN_DOCTOR_CHECKS: tuple[dict[str, Any], ...] = (
+    {
+        "scope": "host",
+        "file": "voice.json",
+        "key": "keys",
+        "severity": "high",
+        "message": "plaintext voice API keys in voice.json; move to host vault",
+    },
+    {
+        "scope": "workspace",
+        "file": "calendar.json",
+        "key": "password",
+        "severity": "high",
+        "message": "plaintext CalDAV password in calendar.json",
+    },
+    {
+        "scope": "workspace",
+        "file": "sync_config.json",
+        "key": "token",
+        "severity": "high",
+        "message": "plaintext sync token in sync_config.json",
+    },
+    {
+        "scope": "workspace",
+        "file": "voice.json",
+        "key": "keys",
+        "severity": "high",
+        "message": "plaintext voice API keys in voice.json",
+    },
+    {
+        "scope": "workspace",
+        "file": "relay/vapid.json",
+        "severity": "medium",
+        "message": "legacy relay credential file in workspace: vapid.json",
+    },
+    {
+        "scope": "workspace",
+        "file": "relay/push.json",
+        "severity": "medium",
+        "message": "legacy relay credential file in workspace: push.json",
+    },
+    {
+        "scope": "workspace",
+        "file": "relay/remotes.json",
+        "severity": "medium",
+        "message": "legacy relay remote file in workspace: remotes.json",
+    },
+)
+
+
+def _load_doctor_checks(host: Host) -> list[dict[str, Any]]:
+    checks = [dict(c) for c in _BUILTIN_DOCTOR_CHECKS]
+    ddir = host.dir / "doctor.d"
+    if not ddir.is_dir():
+        return checks
+    for path in sorted(ddir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        items = (
+            data
+            if isinstance(data, list)
+            else data.get("checks") if isinstance(data, dict) else None
+        )
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and str(item.get("file") or "").strip():
+                checks.append(dict(item))
+    return checks
+
+
+def _eval_doctor_check(
+    issues: list[dict[str, str]], base: Path, check: dict[str, Any], *, scope: str
+) -> None:
+    if str(check.get("scope") or "workspace") != scope:
+        return
+    rel = str(check.get("file") or "").strip()
+    if not rel or ".." in Path(rel).parts:
+        return
+    path = base / rel
+    severity = str(check.get("severity") or "medium")
+    if severity not in ("info", "low", "medium", "high"):
+        severity = "medium"
+    message = str(check.get("message") or f"sensitive material in {rel}")
+    key = check.get("key")
+    if key is None:
+        if path.is_file():
+            _add_issue(issues, severity, path, message)
+        return
+    node: Any = _json_dict(path)
+    for part in str(key).split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    if node:
+        _add_issue(issues, severity, path, message)
+
+
 def doctor(
     host: Host | None = None, *, env: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -453,14 +557,9 @@ def doctor(
         for p in sorted(target.keys.glob("*.ed25519")):
             _check_perms(issues, p, 0o600)
 
-    host_voice = target.dir / "voice.json"
-    if host_voice.is_file() and _json_dict(host_voice).get("keys"):
-        _add_issue(
-            issues,
-            "high",
-            host_voice,
-            "plaintext voice API keys in voice.json; move to host vault",
-        )
+    doctor_checks = _load_doctor_checks(target)
+    for check in doctor_checks:
+        _eval_doctor_check(issues, target.dir, check, scope="host")
 
     if target.secrets.is_file() and _json_dict(target.secrets):
         _add_issue(
@@ -492,28 +591,8 @@ def doctor(
         dotenv = ws.dir / ".env"
         if dotenv.is_file():
             _add_issue(issues, "high", dotenv, "plaintext .env inside workspace tree")
-        if ws.calendar.is_file() and _json_dict(ws.calendar).get("password"):
-            _add_issue(
-                issues,
-                "high",
-                ws.calendar,
-                "plaintext CalDAV password in calendar.json",
-            )
-        if ws.sync_config.is_file() and _json_dict(ws.sync_config).get("token"):
-            _add_issue(
-                issues,
-                "high",
-                ws.sync_config,
-                "plaintext sync token in sync_config.json",
-            )
-        voice_cfg = ws.dir / "voice.json"
-        if voice_cfg.is_file() and _json_dict(voice_cfg).get("keys"):
-            _add_issue(
-                issues,
-                "high",
-                voice_cfg,
-                "plaintext voice API keys in voice.json",
-            )
+        for check in doctor_checks:
+            _eval_doctor_check(issues, ws.dir, check, scope="workspace")
         if ws.mcp_json.is_file():
             data = _json_dict(ws.mcp_json)
             servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
@@ -527,16 +606,6 @@ def doctor(
                     ws.mcp_json,
                     "workspace mcp.json defines env entries; move server config to host mcp/",
                 )
-        for rel in ("vapid.json", "push.json", "remotes.json"):
-            rpath = ws.relay_state / rel
-            if rpath.is_file():
-                _add_issue(
-                    issues,
-                    "medium",
-                    rpath,
-                    f"legacy relay credential/remote file in workspace: {rel}",
-                )
-
     if target.dir == default_host_dir():
         legacy_klanker = Path.home() / ".klanker"
         if legacy_klanker.exists():

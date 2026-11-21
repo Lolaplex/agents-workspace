@@ -57,6 +57,7 @@ _SAFE_AGENTS_ENV = frozenset({
     "AGENTS_ROUTINE_RUNS_DIR",
     "AGENTS_PERSONAS_DIR",
     "AGENTS_CONTENT_DIR",
+    "AGENTS_BROWSER_HOME",
     "AGENTS_BROWSER_PROFILE",
     "AGENTS_BROWSER_PROFILE_NAME",
     "AGENTS_BROWSER_SESSION",
@@ -247,13 +248,25 @@ def _docker_env_flags(env: Mapping[str, str]) -> list[str]:
     return flags
 
 
-def _merge_spawn_env(env: Mapping[str, str] | None) -> dict[str, str]:
+def _merge_spawn_env(
+    env: Mapping[str, str] | None, merge: bool | None = None
+) -> dict[str, str]:
+    """Child env for spawn/run.
+
+    ``env=None`` inherits the host env minus INFRA secrets. ``merge=True``
+    overlays ``env`` on the same stripped host env (for partial overrides);
+    ``merge=False`` uses ``env`` verbatim (for complete envs such as
+    ``ws.env()``). ``merge=None`` keeps the one-release heuristic: an env
+    already carrying PATH is treated as complete.
+    """
     if env is None:
         return {
             k: v for k, v in os.environ.items()
             if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
         }
-    if "PATH" in env or "Path" in env:
+    if merge is None:
+        merge = "PATH" not in env and "Path" not in env
+    if not merge:
         return dict(env)
     merged = {
         k: v for k, v in os.environ.items()
@@ -269,14 +282,17 @@ def spawn(
     env: Mapping[str, str] | None = None,
     *,
     pipes: bool = False,
+    merge: bool | None = None,
 ) -> subprocess.Popen:
     """Spawn ``argv`` under the workspace boundary.
 
     ``local``: plain subprocess with the merged env (status quo).
     ``container``: ``docker exec -i`` into the ws warm container, env
     passthrough via ``-e`` flags (secrets never hit ws files).
-    ``pipes=True`` wires stdout/stderr through PIPE for stream readers."""
-    child_env = _merge_spawn_env(env)
+    ``pipes=True`` wires stdout/stderr through PIPE for stream readers.
+    ``merge``: ``True`` overlays ``env`` on the stripped host env, ``False``
+    uses it verbatim; ``None`` keeps the PATH-sniff heuristic (one release)."""
+    child_env = _merge_spawn_env(env, merge)
     kw = (
         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
          "encoding": "utf-8", "errors": "replace", "bufsize": 1}
@@ -328,9 +344,10 @@ def run(
     *,
     capture: bool = True,
     timeout: int = 0,
+    merge: bool | None = None,
 ) -> subprocess.CompletedProcess:
     """Blocking variant of spawn(): run argv under the ws boundary."""
-    child_env = _merge_spawn_env(env)
+    child_env = _merge_spawn_env(env, merge)
     if isolation_of(ws, env) != "container":
         return subprocess.run(
             argv, capture_output=capture, encoding="utf-8", errors="replace",

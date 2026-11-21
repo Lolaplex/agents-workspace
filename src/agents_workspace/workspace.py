@@ -169,6 +169,7 @@ _ENV_KEYS = frozenset(
         "AGENTS_MEMORY_DIR",
         "AGENTS_RELAY_DIR",
         "AGENTS_CONTENT_DIR",
+        "AGENTS_BROWSER_HOME",
         "AGENTS_BROWSER_PROFILE",
         "AGENTS_BROWSER_PROFILE_NAME",
         "AGENTS_BROWSER_SESSION",
@@ -1033,7 +1034,7 @@ class Workspace:
             ("AGENTS_ROUTINE_RUNS_DIR", None, self.routine_runs),
             ("AGENTS_PERSONAS_DIR", None, self.personas),
             ("AGENTS_CONTENT_DIR", None, self.content),
-            ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION", host.browser),
+            ("AGENTS_BROWSER_HOME", None, host.browser),
             ("AGENTS_BROWSER_PROFILE_NAME", None, self.browser_profile),
             (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY, self.identity),
             ("AGENTS_KNOWN_DIDS_FILE", "AGENTS_KNOWN_DIDS",
@@ -1047,6 +1048,13 @@ class Workspace:
             out[new_name] = str(value)
             if alias:
                 out[alias] = str(value)
+        # AGENTS_BROWSER_PROFILE/SESSION are pass-through only: an explicit
+        # caller choice (profile name or dir) survives, but env() no longer
+        # overloads PROFILE with the browser state root — AGENTS_BROWSER_HOME
+        # carries that.
+        for legacy in ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION"):
+            if raw_base.get(legacy):
+                out[legacy] = raw_base[legacy]
         return out
 
     # --- reporting -----------------------------------------------------
