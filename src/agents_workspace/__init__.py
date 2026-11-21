@@ -14,6 +14,8 @@ from .workspace import (
     ENV_WORKSPACE,
     ENV_WORKSPACES_DIR,
     FILE_DOMAINS,
+    INFRA_SECRET_KEYS,
+    LLM_SECRET_KEYS,
     REMOVED_ENV,
     Host,
     Workspace,
@@ -22,8 +24,11 @@ from .workspace import (
     default_host_dir,
     delegate_depth,
     delegate_env,
+    denied_paths,
+    host_config,
     host_dir,
     resolve_secret,
+    workspace_config,
 )
 
 __version__ = "0.1.0"
@@ -42,6 +47,8 @@ __all__ = [
     "ENV_WORKSPACE",
     "ENV_WORKSPACES_DIR",
     "FILE_DOMAINS",
+    "INFRA_SECRET_KEYS",
+    "LLM_SECRET_KEYS",
     "REMOVED_ENV",
     "Host",
     "Workspace",
@@ -50,7 +57,10 @@ __all__ = [
     "default_host_dir",
     "delegate_depth",
     "delegate_env",
+    "denied_paths",
+    "host_config",
     "host_dir",
     "resolve_secret",
+    "workspace_config",
     "__version__",
 ]
