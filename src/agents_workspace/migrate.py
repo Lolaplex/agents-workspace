@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .workspace import DIR_DOMAINS, Host, Workspace
+from .workspace import DIR_DOMAINS, INFRA_SECRET_KEYS, Host, Workspace, default_host_dir
 
 # Legacy entries that belong to a workspace's data tree.
 _WS_FILES = (
@@ -31,10 +32,9 @@ _WS_FILES = (
 # Legacy entries that stay on (or move to) host infrastructure.
 # "archive"/"conflicts" are produced by migration runs themselves; listing
 # them here keeps later runs from sweeping them into a workspace.
-_HOST_DIRS = ("keys", "run", "cache", "logs", "clients", "browser",
-              "providers", "archive", "conflicts")
+_HOST_DIRS = ("keys", "secrets", "run", "cache", "logs", "clients", "browser",
+              "providers", "mcp", "archive", "conflicts")
 _HOST_FILES = (
-    "secrets.json",
     "agents.json",
     "host_paths.json",
     "users.json",
@@ -42,6 +42,7 @@ _HOST_FILES = (
     "mcp.json",
     "voice.json",
     "known-dids.jsonl",
+    "approval-allowlist.json",
     # root injection targets stay host-level (NAMING C62)
     "AGENTS.md",
     "CLAUDE.md",
@@ -72,18 +73,163 @@ _STALE_EMPTY_DIRS = ("workspace",)  # pre-workspaces/ singular leftover
 class Move:
     src: Path
     dst: Path
-    kind: str  # "ws" | "host" | "external" | "delete" | "merge-users"
+    kind: str  # "ws" | "host" | "external" | "delete" | "merge-*"
                # executor-generated: "merge" (leaf) | "conflict" (quarantined)
-    # populated during execution for kind == "merge-users"
+    # populated during execution for merge-* kinds (enables exact rollback)
     merge_src_backup: str = ""
     merge_backup: str = ""
+    merge_had_dst: bool = True
+    extra_dst: str = ""
+    extra_backup: str = ""
+    extra_had_dst: bool = True
 
     def to_dict(self) -> dict:
         d = {"src": str(self.src), "dst": str(self.dst), "kind": self.kind}
-        if self.kind == "merge-users":
+        if self.kind.startswith("merge-"):
             d["merge_src_backup"] = self.merge_src_backup
             d["merge_backup"] = self.merge_backup
+            d["merge_had_dst"] = self.merge_had_dst
+        if self.extra_dst:
+            d["extra_dst"] = self.extra_dst
+            d["extra_backup"] = self.extra_backup
+            d["extra_had_dst"] = self.extra_had_dst
         return d
+
+
+def _safe_json_dict(raw: str) -> dict:
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _write_vault_dict(path: Path, data: dict) -> None:
+    from .secrets import _atomic_write_json
+
+    clean = {k: v for k, v in data.items() if isinstance(v, str) and v}
+    _atomic_write_json(path, clean)
+
+
+def _merge_vault_file(m: Move, *, skip_keys: frozenset[str] = frozenset()) -> None:
+    src_body = m.src.read_text(encoding="utf-8")
+    m.merge_src_backup = src_body
+    m.merge_had_dst = m.dst.exists()
+    m.merge_backup = m.dst.read_text(encoding="utf-8") if m.merge_had_dst else ""
+    src_dict = _safe_json_dict(src_body)
+    dst_dict = _safe_json_dict(m.merge_backup) if m.merge_had_dst else {}
+    added = False
+    for k, v in src_dict.items():
+        if k in skip_keys or not isinstance(v, str) or not v:
+            continue
+        if k not in dst_dict:
+            dst_dict[k] = v
+            added = True
+    if added or m.merge_had_dst:
+        _write_vault_dict(m.dst, dst_dict)
+    m.src.unlink()
+
+
+def _merge_relay_secret_file(m: Move) -> None:
+    src_body = m.src.read_text(encoding="utf-8")
+    m.merge_src_backup = src_body
+    m.merge_had_dst = m.dst.exists()
+    m.merge_backup = m.dst.read_text(encoding="utf-8") if m.merge_had_dst else ""
+    token = src_body.strip()
+    if token:
+        dst_dict = _safe_json_dict(m.merge_backup) if m.merge_had_dst else {}
+        dst_dict.setdefault("RELAY_WEB_TOKEN", token)
+        _write_vault_dict(m.dst, dst_dict)
+    m.src.unlink()
+
+
+def _merge_remotes_file(m: Move) -> None:
+    src_body = m.src.read_text(encoding="utf-8")
+    m.merge_src_backup = src_body
+    m.merge_had_dst = m.dst.exists()
+    m.merge_backup = m.dst.read_text(encoding="utf-8") if m.merge_had_dst else ""
+
+    src_data = _safe_json_dict(src_body)
+    src_remotes = src_data.get("remotes")
+    if not isinstance(src_remotes, dict):
+        src_remotes = {
+            k: v for k, v in src_data.items() if isinstance(v, dict)
+        }
+    dst_data = _safe_json_dict(m.merge_backup) if m.merge_had_dst else {}
+    dst_remotes = dst_data.get("remotes")
+    if not isinstance(dst_remotes, dict):
+        dst_remotes = {}
+
+    vault_path = Path(m.extra_dst)
+    m.extra_had_dst = vault_path.exists()
+    m.extra_backup = vault_path.read_text(encoding="utf-8") if m.extra_had_dst else ""
+    vault_dict = _safe_json_dict(m.extra_backup) if m.extra_had_dst else {}
+    vault_changed = False
+
+    for rid, info in src_remotes.items():
+        if not isinstance(info, dict):
+            continue
+        dst_remotes.setdefault(
+            rid,
+            {
+                "base_url": str(info.get("base_url") or ""),
+                "label": str(info.get("label") or ""),
+            },
+        )
+        sec = str(info.get("secret") or info.get("token") or "").strip()
+        if sec:
+            clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(rid).strip()).upper()
+            vkey = f"REMOTE_{clean}_TOKEN"
+            if vkey not in vault_dict:
+                vault_dict[vkey] = sec
+                vault_changed = True
+
+    if dst_remotes or m.merge_had_dst:
+        m.dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = m.dst.with_name(f".{m.dst.name}.tmp")
+        tmp.write_text(
+            json.dumps({"remotes": dst_remotes}, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, m.dst)
+    if vault_changed:
+        _write_vault_dict(vault_path, vault_dict)
+    m.src.unlink()
+
+
+def _merge_instance_file(m: Move) -> None:
+    src_body = m.src.read_text(encoding="utf-8")
+    m.merge_src_backup = src_body
+    m.merge_had_dst = m.dst.exists()
+    m.merge_backup = m.dst.read_text(encoding="utf-8") if m.merge_had_dst else ""
+
+    inst = _safe_json_dict(src_body)
+    inst_id = str(inst.get("id") or m.src.parent.name).strip()
+    if inst_id:
+        inst["id"] = inst_id
+    inst.pop("secret", None)
+    if isinstance(inst.get("endpoint"), dict):
+        inst["endpoint"].pop("secret", None)
+
+    items: list[dict] = []
+    if m.merge_had_dst:
+        try:
+            prev = json.loads(m.merge_backup)
+            if isinstance(prev, list):
+                items = [x for x in prev if isinstance(x, dict)]
+        except json.JSONDecodeError:
+            items = []
+
+    if not any(str(x.get("id") or "") == inst_id for x in items):
+        items.append(inst)
+
+    m.dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = m.dst.with_name(f".{m.dst.name}.tmp")
+    tmp.write_text(
+        json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, m.dst)
+    m.src.unlink()
 
 
 def _merge_users_file(m: Move) -> None:
@@ -214,9 +360,102 @@ def plan_migration(host: Host, ws_id: str = "default",
         moves.append(Move(prompt, Path("") if dst.is_file() else dst,
                           "delete" if dst.is_file() else "host"))
 
-    # 4. external roots
+    # Legacy host/secrets.json -> <host>/secrets/host.json
+    if (host_dir / "secrets.json").is_file():
+        moves.append(Move(
+            host_dir / "secrets.json",
+            host_dir / "secrets" / "host.json",
+            "merge-vault-host",
+        ))
+
+    # Relocate legacy relay credentials/remotes & ws secrets across legacy & existing ws
+    _plan_relay_and_ws_secrets(moves, host_dir, ws_dir)
+
+    # 4. external roots (only when explicit home given or migrating default host)
     archive = host_dir / "archive"
-    home = home or Path.home()
+    resolved_home = home or (
+        Path.home() if _norm(host_dir) == _norm(default_host_dir()) else None
+    )
+    if resolved_home is not None:
+        _plan_external_roots(moves, host_dir, ws_dir, archive, resolved_home)
+
+    # 5. catch-all: backups archive, stale empties die, rest goes to archive/unclassified
+    planned_srcs = {m.src for m in moves}
+    for entry in sorted(host_dir.iterdir()):
+        if entry.name == "workspaces" or entry in planned_srcs:
+            continue
+        if _ARCHIVE_MARK in entry.name or entry.name.endswith(".bak"):
+            moves.append(Move(entry, archive / entry.name, "host"))
+        elif entry.name in _STALE_EMPTY_DIRS and entry.is_dir():
+            if any(entry.iterdir()):
+                moves.append(Move(entry, archive / entry.name, "host"))
+            else:
+                moves.append(Move(entry, Path(""), "delete"))
+        else:
+            moves.append(Move(entry, archive / "unclassified" / entry.name, "host"))
+
+    # Keep parent relay moves AFTER leaf relay file extractions above
+    moves = [m for m in moves
+             if m.kind == "delete" or _norm(m.src) != _norm(m.dst)]
+    return moves
+
+
+def _plan_relay_files(moves: list[Move], host_dir: Path, relay_dir: Path) -> None:
+    if not relay_dir.is_dir():
+        return
+    mapping = (
+        ("vapid.json", host_dir / "keys" / "vapid.json", "host"),
+        ("push.json", host_dir / "secrets" / "push.json", "host"),
+        ("chat_prefs.json", host_dir / "clients" / "telegram.json", "host"),
+    )
+    for fname, dst, kind in mapping:
+        src = relay_dir / fname
+        if src.is_file():
+            moves.append(Move(src, dst, kind))
+    remotes_src = relay_dir / "remotes.json"
+    if remotes_src.is_file():
+        moves.append(Move(
+            remotes_src,
+            host_dir / "clients" / "remotes.json",
+            "merge-remotes",
+            extra_dst=str(host_dir / "secrets" / "host.json"),
+        ))
+
+
+def _plan_relay_and_ws_secrets(moves: list[Move], host_dir: Path, ws_dir: Path) -> None:
+    seen_ws: set[Path] = set()
+    # Prepend leaf relay/secrets extractions ahead of parent directory moves
+    pre: list[Move] = []
+    _plan_relay_files(pre, host_dir, host_dir / "relay")
+    ws_roots = [ws_dir]
+    if (host_dir / "workspaces").is_dir():
+        for child in sorted((host_dir / "workspaces").iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                ws_roots.append(child)
+    for wroot in ws_roots:
+        res = wroot.resolve()
+        if res in seen_ws:
+            continue
+        seen_ws.add(res)
+        sec = wroot / "secrets.json"
+        if sec.is_file():
+            pre.append(Move(
+                sec,
+                host_dir / "secrets" / f"ws-{wroot.name}.json",
+                "merge-vault-ws",
+            ))
+        _plan_relay_files(pre, host_dir, wroot / "relay")
+    # Place pre moves before step 1 whole-dir moves of host_dir/relay
+    moves[:0] = pre
+
+
+def _plan_external_roots(
+    moves: list[Move],
+    host_dir: Path,
+    ws_dir: Path,
+    archive: Path,
+    home: Path,
+) -> None:
     for pattern in _EXT_WS_GLOBS:
         ext = home / pattern
         if pattern == ".agents-workspaces" and ext.is_dir():
@@ -225,6 +464,9 @@ def plan_migration(host: Host, ws_id: str = "default",
                     moves.append(
                         Move(child, host_dir / "workspaces" / child.name, "external"))
         elif pattern == ".agents-relay" and ext.is_dir():
+            pre_relay: list[Move] = []
+            _plan_relay_files(pre_relay, host_dir, ext)
+            moves[:0] = pre_relay
             moves.append(Move(ext, ws_dir / "relay", "external"))
         elif pattern == ".client" and ext.is_dir():
             moves.append(Move(ext, host_dir / "clients", "external"))
@@ -232,10 +474,30 @@ def plan_migration(host: Host, ws_id: str = "default",
             pid_file = ext / "daemon.pid"
             if pid_file.is_file() and not _pid_file_live(pid_file):
                 moves.append(Move(pid_file, Path(""), "delete"))
-            # Legacy per-instance payload: workspaces merge into the host
-            # workspaces tree; everything else (except the registry's
-            # instance.json, relay-secret and settings.json, which still
-            # live in ~/.klanker) is archived under <host>/archive/klanker/.
+            if (ext / "relay-secret").is_file():
+                moves.append(Move(
+                    ext / "relay-secret",
+                    host_dir / "secrets" / "host.json",
+                    "merge-relay-secret",
+                ))
+            if (ext / "settings.json").is_file():
+                moves.append(Move(
+                    ext / "settings.json",
+                    host_dir / "clients" / "desktop" / "settings.json",
+                    "external",
+                ))
+            if (ext / "serve.json").is_file():
+                moves.append(Move(
+                    ext / "serve.json",
+                    host_dir / "run" / "serve.json",
+                    "external",
+                ))
+            if (ext / "serve.log").is_file():
+                moves.append(Move(
+                    ext / "serve.log",
+                    host_dir / "logs" / "serve.log",
+                    "external",
+                ))
             inst_root = ext / "instances"
             if inst_root.is_dir():
                 for inst in sorted(inst_root.iterdir()):
@@ -243,8 +505,12 @@ def plan_migration(host: Host, ws_id: str = "default",
                         continue
                     for entry in sorted(inst.iterdir()):
                         if entry.name == "instance.json":
-                            continue
-                        if entry.name == "workspaces" and entry.is_dir():
+                            moves.append(Move(
+                                entry,
+                                host_dir / "clients" / "desktop" / "instances.json",
+                                "merge-instances",
+                            ))
+                        elif entry.name == "workspaces" and entry.is_dir():
                             for ws in sorted(entry.iterdir()):
                                 if ws.is_dir():
                                     moves.append(Move(
@@ -260,26 +526,6 @@ def plan_migration(host: Host, ws_id: str = "default",
                                 entry,
                                 archive / "klanker" / inst.name / entry.name,
                                 "external"))
-
-    # 5. catch-all: backups archive, stale empties die, rest is ws data
-    planned_srcs = {m.src for m in moves}
-    for entry in sorted(host_dir.iterdir()):
-        if entry.name == "workspaces" or entry in planned_srcs:
-            continue
-        if _ARCHIVE_MARK in entry.name or entry.name.endswith(".bak"):
-            moves.append(Move(entry, archive / entry.name, "host"))
-        elif entry.name in _STALE_EMPTY_DIRS and entry.is_dir():
-            if any(entry.iterdir()):
-                moves.append(Move(entry, archive / entry.name, "host"))
-            else:
-                moves.append(Move(entry, Path(""), "delete"))
-        else:
-            moves.append(Move(entry, ws_dir / entry.name, "ws"))
-
-    # no-op moves (src already lives at dst on this host)
-    moves = [m for m in moves
-             if m.kind == "delete" or _norm(m.src) != _norm(m.dst)]
-    return moves
 
 
 def _norm(path: Path) -> str:
@@ -353,10 +599,26 @@ def _resolve_collision(m: Move, conflicts_root: Path, host_dir: Path,
 
 def already_migrated(host: Host) -> bool:
     """No legacy markers and a workspaces/ tree exists."""
-    return (host.dir / "workspaces").is_dir() and not any(
+    ws_root = host.dir / "workspaces"
+    if not ws_root.is_dir():
+        return False
+    if any(
         (host.dir / name).exists()
-        for name in (*DIR_DOMAINS, *_WS_FILES, "identity.json", "known-dids.jsonl")
-    )
+        for name in (*DIR_DOMAINS, *_WS_FILES, "identity.json", "known-dids.jsonl", "secrets.json")
+    ):
+        return False
+    for child in ws_root.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if (child / "secrets.json").is_file():
+            return False
+        relay_dir = child / "relay"
+        if any(
+            (relay_dir / rel).is_file()
+            for rel in ("vapid.json", "push.json", "remotes.json", "chat_prefs.json")
+        ):
+            return False
+    return True
 
 
 def _lock(host: Host):
@@ -367,6 +629,45 @@ def _lock(host: Host):
     except FileExistsError:
         raise RuntimeError(f"migration lock held: {lock_path}")
     return fd, lock_path
+
+
+def _rollback_merge(src: Path, dst: Path, m: dict) -> None:
+    if m.get("extra_dst"):
+        edst = Path(m["extra_dst"])
+        if m.get("extra_had_dst", True):
+            edst.parent.mkdir(parents=True, exist_ok=True)
+            edst.write_text(m.get("extra_backup", ""), encoding="utf-8")
+        else:
+            edst.unlink(missing_ok=True)
+    if m.get("merge_had_dst", True):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(m.get("merge_backup", ""), encoding="utf-8")
+    else:
+        dst.unlink(missing_ok=True)
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(m.get("merge_src_backup", ""), encoding="utf-8")
+
+
+def _dispatch_merge(m: Move) -> bool:
+    if m.kind == "merge-users":
+        _merge_users_file(m)
+        return True
+    if m.kind == "merge-vault-host":
+        _merge_vault_file(m)
+        return True
+    if m.kind == "merge-vault-ws":
+        _merge_vault_file(m, skip_keys=INFRA_SECRET_KEYS)
+        return True
+    if m.kind == "merge-relay-secret":
+        _merge_relay_secret_file(m)
+        return True
+    if m.kind == "merge-remotes":
+        _merge_remotes_file(m)
+        return True
+    if m.kind == "merge-instances":
+        _merge_instance_file(m)
+        return True
+    return False
 
 
 def execute_migration(moves: list[Move], host: Host, *,
@@ -399,9 +700,10 @@ def execute_migration(moves: list[Move], host: Host, *,
                         m.src.unlink(missing_ok=True)
                     done.append(m)
                     continue
-                if m.kind == "merge-users":
-                    _merge_users_file(m)
+                if _dispatch_merge(m):
                     done.append(m)
+                    continue
+                if not m.src.exists():
                     continue
                 if m.dst.exists():
                     _resolve_collision(m, conflicts_root, host.dir, done)
@@ -415,10 +717,8 @@ def execute_migration(moves: list[Move], host: Host, *,
                 try:
                     if m.kind == "delete":
                         continue
-                    if m.kind == "merge-users":
-                        if m.merge_backup:
-                            Path(m.dst).write_text(m.merge_backup, encoding="utf-8")
-                            Path(m.src).write_text(m.merge_src_backup, encoding="utf-8")
+                    if m.kind.startswith("merge-"):
+                        _rollback_merge(m.src, m.dst, m.to_dict())
                         continue
                     m.src.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(m.dst), str(m.src))
@@ -448,11 +748,8 @@ def rollback(log_path: Path) -> int:
         dst = Path(m["dst"])
         if m["kind"] == "delete":
             continue  # cannot un-delete a dead pid file; it was stale anyway
-        if m["kind"] == "merge-users":
-            if m.get("merge_backup"):
-                dst.write_text(m["merge_backup"], encoding="utf-8")
-            if m.get("merge_src_backup") is not None:
-                src.write_text(m["merge_src_backup"], encoding="utf-8")
+        if str(m["kind"]).startswith("merge-"):
+            _rollback_merge(src, dst, m)
             restored += 1
             continue
         if not dst.exists():

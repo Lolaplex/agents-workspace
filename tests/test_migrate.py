@@ -37,7 +37,7 @@ def _legacy_tree(host_dir: Path, home: Path) -> None:
         (host_dir / name).write_text("{}", encoding="utf-8")
     (host_dir / "identity.json").write_text('{"users":{}}', encoding="utf-8")
     (host_dir / "known-dids.jsonl").write_text("{}\n", encoding="utf-8")
-    (host_dir / "secrets.json").write_text("{}", encoding="utf-8")
+    (host_dir / "secrets.json").write_text('{"OPENAI_API_KEY": "k1"}', encoding="utf-8")
     (host_dir / "mcp.json").write_text("{}", encoding="utf-8")
     (host_dir / "unknown-thing.md").write_text("data", encoding="utf-8")
     keys = host_dir / "keys"
@@ -79,14 +79,15 @@ class TestMigration(unittest.TestCase):
         for name in ("calendar.json", "store.db", "workspace.json",
                      ".tombstones.json", "sync_config.json"):
             self.assertTrue((ws / name).is_file(), name)
-        # catch-all
-        self.assertTrue((ws / "unknown-thing.md").is_file())
-        # identity -> host users.json; known-dids -> keys/
+        # catch-all moves unclassified files to archive/unclassified (never ws)
+        self.assertTrue((self.host_dir / "archive" / "unclassified" / "unknown-thing.md").is_file())
+        self.assertFalse((ws / "unknown-thing.md").exists())
+        # identity -> host users.json; known-dids -> keys/; secrets -> secrets/host.json
         self.assertTrue((self.host_dir / "users.json").is_file())
         self.assertFalse((self.host_dir / "identity.json").exists())
         self.assertTrue((self.host_dir / "keys" / "known-dids.jsonl").is_file())
-        # host files stayed put (no-op)
-        self.assertTrue((self.host_dir / "secrets.json").is_file())
+        self.assertTrue((self.host_dir / "secrets" / "host.json").is_file())
+        self.assertFalse((self.host_dir / "secrets.json").exists())
         self.assertTrue((self.host_dir / "mcp.json").is_file())
         self.assertTrue((self.host_dir / "keys" / "agent.ed25519").is_file())
         # externals
@@ -300,28 +301,76 @@ class TestMigration(unittest.TestCase):
 
     def test_klanker_instance_payload_merges_and_archives(self):
         self.host_dir.mkdir(parents=True)
-        inst = self.home / ".klanker" / "instances" / "default"
+        klanker = self.home / ".klanker"
+        inst = klanker / "instances" / "default"
         ws_dir = inst / "workspaces" / "default"
         sessions = ws_dir / "personas" / "default" / "sessions"
         sessions.mkdir(parents=True)
         (sessions / "ses_1.json").write_text("{}", encoding="utf-8")
         (ws_dir / "workspace.json").write_text("{}", encoding="utf-8")
-        (inst / "instance.json").write_text("{}", encoding="utf-8")
+        (inst / "instance.json").write_text(
+            json.dumps({"id": "default", "secret": "strip-me"}), encoding="utf-8"
+        )
         (inst / "users.json").write_text("{}", encoding="utf-8")
         (inst / "daemon.pid").write_text("999999999", encoding="utf-8")
+        (klanker / "relay-secret").write_text("pin-tok\n", encoding="utf-8")
+        (klanker / "settings.json").write_text('{"theme":"dark"}', encoding="utf-8")
+        (klanker / "serve.json").write_text('{"pid": 999999999}', encoding="utf-8")
+        (klanker / "serve.log").write_text("boot\n", encoding="utf-8")
         moves = plan_migration(self.host, home=self.home)
         execute_migration(moves, self.host)
         ws = self.host_dir / "workspaces" / "default"
         self.assertTrue(
             (ws / "personas" / "default" / "sessions" / "ses_1.json").is_file())
         self.assertTrue((ws / "workspace.json").is_file())
-        # registry file stays; payload archived; dead pid deleted
-        self.assertTrue((inst / "instance.json").is_file())
+        # desktop registry, settings, serve state, and relay token relocated cleanly
+        self.assertFalse((inst / "instance.json").exists())
+        desktop_reg = self.host_dir / "clients" / "desktop" / "instances.json"
+        self.assertTrue(desktop_reg.is_file())
+        reg_rows = json.loads(desktop_reg.read_text("utf-8"))
+        self.assertEqual(reg_rows[0]["id"], "default")
+        self.assertNotIn("secret", reg_rows[0])
+        self.assertTrue((self.host_dir / "clients" / "desktop" / "settings.json").is_file())
+        self.assertTrue((self.host_dir / "run" / "serve.json").is_file())
+        self.assertTrue((self.host_dir / "logs" / "serve.log").is_file())
+        vault = json.loads((self.host_dir / "secrets" / "host.json").read_text("utf-8"))
+        self.assertEqual(vault["RELAY_WEB_TOKEN"], "pin-tok")
         self.assertTrue(
             (self.host_dir / "archive" / "klanker" / "default"
              / "users.json").is_file())
         self.assertFalse((inst / "daemon.pid").exists())
         self.assertFalse((inst / "workspaces").exists())
+
+    def test_ws_secrets_and_relay_files_relocate_and_rollback(self):
+        ws = self.host.create("default")
+        ws.secrets.write_text(
+            json.dumps({"OPENAI_API_KEY": "ws-key", "RELAY_SECRET": "poison"}),
+            encoding="utf-8",
+        )
+        ws.relay_state.mkdir(parents=True, exist_ok=True)
+        (ws.relay_state / "vapid.json").write_text('{"private":"p"}', encoding="utf-8")
+        (ws.relay_state / "push.json").write_text('{"subs":[]}', encoding="utf-8")
+        (ws.relay_state / "chat_prefs.json").write_text('{"1":{"a":1}}', encoding="utf-8")
+        (ws.relay_state / "remotes.json").write_text(
+            json.dumps({"remotes": {"box1": {"base_url": "https://b1", "label": "B1", "secret": "tok-b1"}}}),
+            encoding="utf-8",
+        )
+        before = _snapshot(self.host_dir)
+        self.assertFalse(already_migrated(self.host))
+        log = execute_migration(plan_migration(self.host, home=self.home), self.host)
+        self.assertTrue(already_migrated(self.host))
+        self.assertFalse(ws.secrets.exists())
+        ws_vault = json.loads((self.host_dir / "secrets" / "ws-default.json").read_text("utf-8"))
+        self.assertEqual(ws_vault, {"OPENAI_API_KEY": "ws-key"})
+        host_vault = json.loads((self.host_dir / "secrets" / "host.json").read_text("utf-8"))
+        self.assertEqual(host_vault["REMOTE_BOX1_TOKEN"], "tok-b1")
+        remotes_meta = json.loads((self.host_dir / "clients" / "remotes.json").read_text("utf-8"))
+        self.assertEqual(remotes_meta["remotes"]["box1"], {"base_url": "https://b1", "label": "B1"})
+        self.assertTrue((self.host_dir / "keys" / "vapid.json").is_file())
+        self.assertTrue((self.host_dir / "secrets" / "push.json").is_file())
+        self.assertTrue((self.host_dir / "clients" / "telegram.json").is_file())
+        rollback(log)
+        self.assertEqual(before, _snapshot(self.host_dir))
 
     def test_stale_regenerable_cache_is_deleted(self):
         self.host_dir.mkdir(parents=True)
