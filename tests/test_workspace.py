@@ -271,6 +271,7 @@ class TestDomains(unittest.TestCase):
             self.assertEqual(child["AGENTS_KEYS_DIR"], str(host.keys))
             self.assertEqual(child["AGENTS_USERS_FILE"], str(host.users_file()))
             self.assertEqual(child["AGENTS_IDENTITY_PATH"], str(host.users_file()))
+            self.assertEqual(child["AGENTS_BROWSER_PROFILE_NAME"], a.browser_profile)
             # persona + workdir params
             child2 = a.env(poison, persona="ops", workdir="/tmp/wd2")
             self.assertEqual(child2["AGENTS_PERSONA"], "ops")

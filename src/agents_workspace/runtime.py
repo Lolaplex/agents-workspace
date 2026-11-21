@@ -23,6 +23,7 @@ LABEL = "klanker-ws"
 ENV_ISOLATION = "AGENTS_WS_ISOLATION"
 ENV_IMAGE = "AGENTS_WS_IMAGE"
 ENV_TTL = "AGENTS_WS_IDLE_TTL"
+ENV_HOST_MAP = "AGENTS_WS_HOST_DIR"
 DEFAULT_IMAGE = "klanker:latest"
 CONTAINER_WS = "/ws"
 
@@ -57,6 +58,7 @@ _SAFE_AGENTS_ENV = frozenset({
     "AGENTS_PERSONAS_DIR",
     "AGENTS_CONTENT_DIR",
     "AGENTS_BROWSER_PROFILE",
+    "AGENTS_BROWSER_PROFILE_NAME",
     "AGENTS_BROWSER_SESSION",
     "AGENTS_KNOWN_DIDS_FILE",
     "AGENTS_KNOWN_DIDS",
@@ -104,7 +106,12 @@ ENV_PASSTHROUGH_PREFIXES = (
 
 
 def _passthrough_keys(host_env: Mapping[str, str]) -> list[str]:
-    blocked = INFRA_SECRET_KEYS | {"AGENTS_SYNC_TOKEN", "AGENTS_ACP_API_KEY", "AGENTS_APPROVAL_TOKEN"}
+    blocked = INFRA_SECRET_KEYS | {
+        "AGENTS_SYNC_TOKEN",
+        "AGENTS_ACP_API_KEY",
+        "AGENTS_APPROVAL_TOKEN",
+        "GIT_ASKPASS",
+    }
     out: list[str] = []
     for k in host_env:
         if k in blocked or k.startswith("RELAY_"):
@@ -214,9 +221,6 @@ def _posix(path) -> str:
     return str(path).replace("\\", "/")
 
 
-ENV_HOST_MAP = "AGENTS_WS_HOST_DIR"
-
-
 def _host_mount(ws: Workspace, env: Mapping[str, str] | None) -> str:
     """Host-side path for the ws mount.
 
@@ -243,6 +247,22 @@ def _docker_env_flags(env: Mapping[str, str]) -> list[str]:
     return flags
 
 
+def _merge_spawn_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    if env is None:
+        return {
+            k: v for k, v in os.environ.items()
+            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
+        }
+    if "PATH" in env or "Path" in env:
+        return dict(env)
+    merged = {
+        k: v for k, v in os.environ.items()
+        if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
+    }
+    merged.update(env)
+    return merged
+
+
 def spawn(
     ws: Workspace,
     argv: list[str],
@@ -256,19 +276,7 @@ def spawn(
     ``container``: ``docker exec -i`` into the ws warm container, env
     passthrough via ``-e`` flags (secrets never hit ws files).
     ``pipes=True`` wires stdout/stderr through PIPE for stream readers."""
-    if env is None:
-        child_env = {
-            k: v for k, v in os.environ.items()
-            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
-        }
-    elif "PATH" in env or "Path" in env:
-        child_env = dict(env)
-    else:
-        child_env = {
-            k: v for k, v in os.environ.items()
-            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
-        }
-        child_env.update(env)
+    child_env = _merge_spawn_env(env)
     kw = (
         {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
          "encoding": "utf-8", "errors": "replace", "bufsize": 1}
@@ -322,19 +330,7 @@ def run(
     timeout: int = 0,
 ) -> subprocess.CompletedProcess:
     """Blocking variant of spawn(): run argv under the ws boundary."""
-    if env is None:
-        child_env = {
-            k: v for k, v in os.environ.items()
-            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
-        }
-    elif "PATH" in env or "Path" in env:
-        child_env = dict(env)
-    else:
-        child_env = {
-            k: v for k, v in os.environ.items()
-            if k not in INFRA_SECRET_KEYS and k != "AGENTS_SYNC_TOKEN"
-        }
-        child_env.update(env)
+    child_env = _merge_spawn_env(env)
     if isolation_of(ws, env) != "container":
         return subprocess.run(
             argv, capture_output=capture, encoding="utf-8", errors="replace",

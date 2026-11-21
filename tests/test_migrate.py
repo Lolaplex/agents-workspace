@@ -372,6 +372,23 @@ class TestMigration(unittest.TestCase):
         rollback(log)
         self.assertEqual(before, _snapshot(self.host_dir))
 
+    def test_ws_secrets_uses_meta_id_and_stale_pid_lock_recovers(self):
+        import json as _json
+
+        ws = self.host.create("dirname")
+        meta = _json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+        meta["id"] = "metaid"
+        ws.workspace_file.write_text(_json.dumps(meta), encoding="utf-8")
+        ws.secrets.write_text(_json.dumps({"K": "v"}), encoding="utf-8")
+        (self.host_dir / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        self.host.run.mkdir(parents=True, exist_ok=True)
+        (self.host.run / "migrate.lock").write_text("999999999\n", encoding="utf-8")
+        moves = plan_migration(self.host, home=self.home)
+        execute_migration(moves, self.host)
+        self.assertTrue((self.host_dir / "secrets" / "ws-metaid.json").is_file())
+        self.assertTrue((self.host_dir / "archive" / "unclassified" / ".env").is_file())
+        self.assertFalse((ws.dir / ".env").exists())
+
     def test_stale_regenerable_cache_is_deleted(self):
         self.host_dir.mkdir(parents=True)
         (self.host_dir / "mcp-tools-cache.json").write_text(

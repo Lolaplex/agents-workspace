@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .workspace import DIR_DOMAINS, INFRA_SECRET_KEYS, Host, Workspace, default_host_dir
+from .workspace import DIR_DOMAINS, INFRA_SECRET_KEYS, Host, Workspace, _read_meta, default_host_dir
 
 # Legacy entries that belong to a workspace's data tree.
 _WS_FILES = (
@@ -26,7 +26,6 @@ _WS_FILES = (
     "workspace.json",
     ".tombstones.json",
     "sync_config.json",
-    ".env",
 )
 
 # Legacy entries that stay on (or move to) host infrastructure.
@@ -439,9 +438,10 @@ def _plan_relay_and_ws_secrets(moves: list[Move], host_dir: Path, ws_dir: Path) 
         seen_ws.add(res)
         sec = wroot / "secrets.json"
         if sec.is_file():
+            target_ws_id = str(_read_meta(wroot).get("id") or "").strip() or wroot.name
             pre.append(Move(
                 sec,
-                host_dir / "secrets" / f"ws-{wroot.name}.json",
+                host_dir / "secrets" / f"ws-{target_ws_id}.json",
                 "merge-vault-ws",
             ))
         _plan_relay_files(pre, host_dir, wroot / "relay")
@@ -624,11 +624,23 @@ def already_migrated(host: Host) -> bool:
 def _lock(host: Host):
     host.run.mkdir(parents=True, exist_ok=True)
     lock_path = host.run / "migrate.lock"
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise RuntimeError(f"migration lock held: {lock_path}")
-    return fd, lock_path
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            return fd, lock_path
+        except FileExistsError:
+            try:
+                pid = int(lock_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                break
+            if pid > 0 and _pid_alive(pid):
+                break
+            try:
+                lock_path.unlink()
+            except OSError:
+                break
+    raise RuntimeError(f"migration lock held: {lock_path}")
 
 
 def _rollback_merge(src: Path, dst: Path, m: dict) -> None:

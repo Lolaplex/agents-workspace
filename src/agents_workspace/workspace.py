@@ -169,6 +169,7 @@ _ENV_KEYS = frozenset(
         "AGENTS_RELAY_DIR",
         "AGENTS_CONTENT_DIR",
         "AGENTS_BROWSER_PROFILE",
+        "AGENTS_BROWSER_PROFILE_NAME",
         "AGENTS_BROWSER_SESSION",
         "AGENTS_KNOWN_DIDS_FILE",
         "AGENTS_KNOWN_DIDS",
@@ -591,13 +592,13 @@ class Workspace:
         return ws
 
     @staticmethod
-    @staticmethod
     def _is_legacy_root(host_dir: Path) -> bool:
         """A host that was never migrated: no workspaces/, legacy domains on top."""
         if (host_dir / "workspaces").is_dir():
             return False
         markers = (
             "memory",
+            "rules",
             "skills",
             "modules",
             "schedules",
@@ -605,6 +606,8 @@ class Workspace:
             "routine-runs",
             "relay",
             "personas",
+            "content",
+            "work",
             "workspace.json",
             "store.db",
             "identity.json",
@@ -972,7 +975,9 @@ class Workspace:
         plus one-release aliases) and strips removed keys, so no value from
         a parent process or a foreign workspace can leak into the child.
         ``role`` narrows sensitive secrets by execution role: ``default``,
-        ``turn``, ``tool``, ``acp``, or ``container``.
+        ``turn``, ``tool``, ``acp``, or ``container``. When ``provider_key_env``
+        is empty on ``turn``/``container``, LLM provider keys stay intact to
+        support interactive per-chat model switching.
         """
         if role not in _ENV_ROLES:
             raise ValueError(f"unknown workspace env role: {role!r}")
@@ -985,7 +990,8 @@ class Workspace:
             for key in INFRA_SECRET_KEYS:
                 if key not in allow:
                     out.pop(key, None)
-            out.pop("AGENTS_SYNC_TOKEN", None) if "AGENTS_SYNC_TOKEN" not in allow else None
+            if "AGENTS_SYNC_TOKEN" not in allow:
+                out.pop("AGENTS_SYNC_TOKEN", None)
         if role in ("turn", "container") and provider_key_env:
             for key in LLM_SECRET_KEYS:
                 if key != provider_key_env and key not in allow:
@@ -1027,6 +1033,7 @@ class Workspace:
             ("AGENTS_PERSONAS_DIR", None, self.personas),
             ("AGENTS_CONTENT_DIR", None, self.content),
             ("AGENTS_BROWSER_PROFILE", "AGENTS_BROWSER_SESSION", host.browser),
+            ("AGENTS_BROWSER_PROFILE_NAME", None, self.browser_profile),
             (ENV_USERS_FILE, ENV_USERS_FILE_LEGACY, self.identity),
             ("AGENTS_KNOWN_DIDS_FILE", "AGENTS_KNOWN_DIDS",
              host.keys / "known-dids.jsonl"),
@@ -1063,7 +1070,7 @@ class Workspace:
         }
 
 
-def denied_paths(ws: Workspace) -> list[Path]:
+def denied_paths(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Path]:
     """Paths always denied to terminal/agent file & shell tools.
 
     Evaluated before ``allowed_roots(ws)`` so host secrets, private keys,
@@ -1071,6 +1078,7 @@ def denied_paths(ws: Workspace) -> list[Path]:
     unreachable even when ``ws.dir`` itself is allowed.
     """
     host = ws.host
+    env_map = ws.source_env if env is None and ws.source_env else env
     return [
         host.keys,
         host.secrets,
@@ -1078,7 +1086,7 @@ def denied_paths(ws: Workspace) -> list[Path]:
         host.mcp_json,
         host.mcp_dir,
         host.agents_json,
-        host.users_file(),
+        host.users_file(env_map),
         host.approval_allowlist,
         ws.secrets,
         ws.members,

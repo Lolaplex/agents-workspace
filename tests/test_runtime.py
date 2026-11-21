@@ -86,8 +86,10 @@ class TestPassthrough(unittest.TestCase):
                 "GH_TOKEN": "x",
                 "OPENROUTER_API_KEY": "x",
                 "AGENTS_WORKSPACE": "w",
+                "AGENTS_BROWSER_PROFILE_NAME": "work",
                 "AGENTS_SYNC_TOKEN": "secret-sync",
                 "AGENTS_APPROVAL_TOKEN": "secret-app",
+                "GIT_ASKPASS": "/tmp/askpass",
                 "RELAY_SECRET": "rsec",
                 "RELAY_WEB_TOKEN": "rweb",
                 "TELEGRAM_BOT_TOKEN": "tbot",
@@ -98,9 +100,11 @@ class TestPassthrough(unittest.TestCase):
         self.assertIn("GH_TOKEN", keys)
         self.assertIn("OPENROUTER_API_KEY", keys)
         self.assertIn("AGENTS_WORKSPACE", keys)
+        self.assertIn("AGENTS_BROWSER_PROFILE_NAME", keys)
         for blocked in (
             "AGENTS_SYNC_TOKEN",
             "AGENTS_APPROVAL_TOKEN",
+            "GIT_ASKPASS",
             "RELAY_SECRET",
             "RELAY_WEB_TOKEN",
             "TELEGRAM_BOT_TOKEN",

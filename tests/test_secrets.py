@@ -115,7 +115,7 @@ class TestHostSecretVault(unittest.TestCase):
             write_secret("OPENAI_API_KEY", "host-val", host=host, scope="host")
             fake_kr = types.SimpleNamespace(
                 get_password=lambda svc, k: "kr-host"
-                if svc == "lolaplex-agents-host" and k == "OPENAI_API_KEY"
+                if svc == "agents-host" and k == "OPENAI_API_KEY"
                 else ""
             )
             with patch.dict(sys.modules, {"keyring": fake_kr}):
@@ -159,6 +159,27 @@ class TestHostSecretVault(unittest.TestCase):
             self.assertIn(str(ws.secrets), paths)
             self.assertIn(str(ws.dir / ".env"), paths)
             self.assertIn(str(ws.calendar), paths)
+
+    def test_explicit_host_read_write_symmetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("work")
+            write_secret(
+                "OPENAI_API_KEY",
+                "sk-explicit-host-ws",
+                host=host,
+                scope="workspace",
+                env={"AGENTS_WORKSPACE": "work"},
+            )
+            self.assertEqual(
+                resolve_secret(
+                    "OPENAI_API_KEY",
+                    host=host,
+                    scope="workspace",
+                    env={"AGENTS_WORKSPACE": "work"},
+                ),
+                "sk-explicit-host-ws",
+            )
 
 
 if __name__ == "__main__":

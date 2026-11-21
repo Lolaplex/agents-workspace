@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .workspace import (
+    ENV_WORKSPACE,
     INFRA_SECRET_KEYS,
     Host,
     Workspace,
@@ -23,7 +24,8 @@ ENV_KEYRING = "AGENTS_KEYRING"
 _KEY_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 _EXPAND_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _RUN_SECRETS_DIR = Path("/run/secrets")
-_SERVICE_HOST = "lolaplex-agents-host"
+_SERVICE_HOST = "agents-host"
+_SERVICE_WS_PREFIX = "agents-ws-"
 _SCOPES = frozenset({"auto", "host", "workspace"})
 
 
@@ -129,6 +131,21 @@ def _read_key_from_json(path: Path, key: str) -> str:
     return val if isinstance(val, str) and val else ""
 
 
+def _select_existing_ws(host: Host, env: Mapping[str, str]) -> Workspace | None:
+    """Resolve existing workspace on ``host`` without creating one implicitly."""
+    if str(env.get(ENV_WORKSPACE) or "").strip():
+        try:
+            return host.select_workspace(env=env)
+        except ValueError:
+            return None
+    if not host.list_workspaces(env=env):
+        return None
+    try:
+        return host.select_workspace(env=env)
+    except ValueError:
+        return None
+
+
 def _resolve_target(
     *,
     ws: Workspace | None,
@@ -138,15 +155,16 @@ def _resolve_target(
 ) -> tuple[Host, Workspace | None]:
     if ws is not None:
         return (host or ws.host), ws
+    target_host = host or Host.from_env(env)
     if not need_ws:
-        return (host or Host.from_env(env)), None
+        return target_host, None
     if host is not None:
-        return host, None
+        return target_host, _select_existing_ws(target_host, env)
     try:
         selected = Workspace.from_env(env)
         return selected.host, selected
     except ValueError:
-        return Host.from_env(env), None
+        return target_host, _select_existing_ws(target_host, env)
 
 
 def resolve_secret(
@@ -207,7 +225,7 @@ def resolve_secret(
             if val:
                 return val
         kr_ws = _keyring_get(
-            f"lolaplex-agents-ws-{target_ws.id}", key, target_host, env_map
+            f"{_SERVICE_WS_PREFIX}{target_ws.id}", key, target_host, env_map
         )
         if kr_ws:
             return kr_ws
@@ -244,7 +262,12 @@ def _target_vault_file(
     if scope == "host":
         target_host = host or (ws.host if ws is not None else Host.from_env(env_map))
         return secrets_host_file(target_host)
-    target_ws = ws or Workspace.from_env(env_map)
+    if ws is not None:
+        target_ws = ws
+    elif host is not None:
+        target_ws = host.select_workspace(env=env_map)
+    else:
+        target_ws = Workspace.from_env(env_map)
     return secrets_ws_file(target_ws)
 
 
