@@ -462,15 +462,19 @@ class TestAllowedRoots(unittest.TestCase):
             roots = allowed_roots(ws, env={})
             denied = denied_paths(ws)
             self.assertIn(ws.dir, roots)
-            for path in (
-                ws.host.run, ws.host.cache, ws.host.logs, ws.host.clients,
-            ):
+            for path in (ws.host.run, ws.host.cache):
                 self.assertIn(path, roots)
+            for excluded in (ws.host.logs, ws.host.clients):
+                self.assertNotIn(excluded, roots)
+                self.assertIn(excluded, denied)
             for secret_path in (
                 ws.host.keys, ws.host.secrets, ws.host.dir / "secrets",
                 ws.host.mcp_json, ws.host.dir / "mcp",
                 ws.host.agents_json, ws.host.users_file(),
                 ws.host.dir / "approval-allowlist.json",
+                ws.host.run / "approvals",
+                ws.host.logs,
+                ws.host.clients,
                 ws.secrets, ws.members,
             ):
                 self.assertNotIn(secret_path, roots)

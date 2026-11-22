@@ -1083,8 +1083,9 @@ def denied_paths(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Pa
     """Paths always denied to terminal/agent file & shell tools.
 
     Evaluated before ``allowed_roots(ws)`` so host secrets, private keys,
-    and control-plane files (or sensitive files inside ``ws.dir``) stay
-    unreachable even when ``ws.dir`` itself is allowed.
+    logs, client prefs/registries, pending approvals, and control-plane
+    files (or sensitive files inside ``ws.dir``) stay unreachable even when
+    ``ws.dir`` or ``host.run`` is allowed.
     """
     host = ws.host
     env_map = ws.source_env if env is None and ws.source_env else env
@@ -1097,6 +1098,9 @@ def denied_paths(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Pa
         host.agents_json,
         host.users_file(env_map),
         host.approval_allowlist,
+        host.run / "approvals",
+        host.logs,
+        host.clients,
         ws.secrets,
         ws.members,
     ]
@@ -1107,7 +1111,8 @@ def allowed_roots(ws: Workspace, env: Mapping[str, str] | None = None) -> list[P
 
     Single source for the root list the harness executor, the terminal
     policy, and the delegate clamp honor: the workspace tree plus
-    non-secret host runtime dirs (run, cache, logs, clients) plus
+    non-secret host runtime dirs (``run``, ``cache``; ``run/approvals``,
+    ``logs``, and ``clients`` stay denied via ``denied_paths(ws)``) plus
     env-listed dirs. Keys, secrets, control-plane files, and MCP configs
     are excluded (see ``denied_paths(ws)``). Host memory/skills do not
     exist — they are never allowed (D-host-layer). Callers that also
@@ -1119,8 +1124,6 @@ def allowed_roots(ws: Workspace, env: Mapping[str, str] | None = None) -> list[P
         ws.dir,
         host.run,
         host.cache,
-        host.logs,
-        host.clients,
     ]
     for key in (
         "AGENTS_SKILLS_DIR",
