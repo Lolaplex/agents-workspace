@@ -850,3 +850,147 @@ class TestResolveEntryWorkspace(unittest.TestCase):
             ws = host.resolve_entry_workspace({})
             self.assertEqual(ws.id, "default")
             self.assertTrue(host.workspace_exists("default"))
+
+
+class TestWorkspaceWorkdirSchema(unittest.TestCase):
+    def test_workdir_and_lock_emitted_per_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            proj_a = Path(tmp) / "projA"
+            proj_a.mkdir()
+            ws_a = host.update_workspace(
+                host.create("a").id,
+                workdir=str(proj_a),
+                workdir_lock=True,
+            )
+            ws_b = host.create("b")
+            env_a = ws_a.env({})
+            env_b = ws_b.env({})
+            self.assertEqual(env_a["AGENTS_WORKDIR"], str(proj_a.resolve()))
+            self.assertEqual(env_a["AGENTS_WORKDIR_LOCK"], "1")
+            self.assertEqual(env_b["AGENTS_WORKDIR"], str(ws_b.dir / "work"))
+            self.assertNotIn("AGENTS_WORKDIR_LOCK", env_b)
+            self.assertNotEqual(env_a["AGENTS_WORKDIR"], env_b["AGENTS_WORKDIR"])
+
+    def test_explicit_env_workdir_beats_workspace_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            ws = host.update_workspace(
+                host.create("a").id, workdir=str(Path(tmp) / "projA")
+            )
+            env = ws.env({"AGENTS_WORKDIR": "/tmp/override"})
+            self.assertEqual(env["AGENTS_WORKDIR"], str(_p("/tmp/override")))
+
+    def test_env_workdir_param_beats_workspace_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            ws = host.update_workspace(
+                host.create("a").id, workdir=str(Path(tmp) / "projA")
+            )
+            env = ws.env({}, workdir="/tmp/param")
+            self.assertEqual(env["AGENTS_WORKDIR"], str(_p("/tmp/param")))
+
+    def test_update_workspace_validations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.create("a")
+            with self.assertRaises(ValueError):
+                host.update_workspace("ghost", label="x")
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", workdir=str(host.secrets_dir))
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", workdir=str(host.keys / "k"))
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", workdir="/tmp/x\x00y")
+            ws = host.update_workspace("a", label="  New Label  ")
+            self.assertEqual(ws.label, "New Label")
+            ws = host.update_workspace("a", workdir=None, workdir_lock=False)
+            import json
+
+            data = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            self.assertNotIn("workdir", data)
+            self.assertNotIn("workdir_lock", data)
+            self.assertEqual(data["label"], "New Label")
+
+    def test_dangerous_stored_workdir_ignored_with_warning(self):
+        import json
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            ws = host.create("a")
+            data = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            data["workdir"] = str(host.secrets_dir)
+            ws.workspace_file.write_text(json.dumps(data), encoding="utf-8")
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                env = ws.env({})
+            self.assertEqual(env["AGENTS_WORKDIR"], str(ws.dir / "work"))
+            self.assertTrue(any(w.category is UserWarning for w in seen))
+
+    def test_caller_workdir_lock_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.update_workspace(
+                host.create("a").id, workdir_lock=True
+            )
+            env = ws.env({"AGENTS_WORKDIR_LOCK": "0"})
+            self.assertEqual(env["AGENTS_WORKDIR_LOCK"], "0")
+
+
+class TestWorkspaceConfig(unittest.TestCase):
+    def test_read_missing_and_invalid(self):
+        import json
+
+        from agents_workspace import read_workspace_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            self.assertEqual(read_workspace_config(ws), {})
+            ws.config.write_text("{bad", encoding="utf-8")
+            self.assertEqual(read_workspace_config(ws), {})
+            ws.config.write_text(json.dumps([1, 2]), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                read_workspace_config(ws)
+
+    def test_update_approval_mode_roundtrip_and_validation(self):
+        from agents_workspace import read_workspace_config, update_workspace_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            out = update_workspace_config(ws, {"approval": {"mode": "strict"}})
+            self.assertEqual(out["approval"]["mode"], "strict")
+            self.assertEqual(read_workspace_config(ws)["approval"]["mode"], "strict")
+            with self.assertRaises(ValueError):
+                update_workspace_config(ws, {"approval": {"mode": "yolo"}})
+            # clearing with empty value
+            out = update_workspace_config(ws, {"approval": {"mode": ""}})
+            self.assertNotIn("mode", out["approval"])
+
+    def test_update_rejects_secret_keys(self):
+        from agents_workspace import update_workspace_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            for bad in (
+                {"RELAY_SECRET": "x"},
+                {"OPENROUTER_API_KEY": "x"},
+                {"nested": {"MY_TOKEN": "x"}},
+            ):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    update_workspace_config(ws, bad)
+            self.assertFalse(ws.config.exists() and "RELAY_SECRET" in ws.config.read_text())
+
+    def test_update_deep_merges(self):
+        from agents_workspace import update_workspace_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            update_workspace_config(ws, {"model": {"provider": "openai"}})
+            out = update_workspace_config(ws, {"model": {"name": "gpt-5"}})
+            self.assertEqual(out["model"], {"provider": "openai", "name": "gpt-5"})

@@ -29,7 +29,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from .compat import read_alias
 
@@ -190,6 +190,27 @@ _ENV_KEYS = frozenset(
 )
 
 _ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# Sentinel for "argument not passed" in update helpers (None means clear).
+_UNSET: Any = object()
+
+ALLOWED_APPROVAL_MODES = ("off", "ask", "strict")
+
+# Keys that must never land in a non-secret <ws>/config.json.
+_SECRETISH_KEY = re.compile(
+    r"(SECRET|TOKEN|PASSWORD|API[_-]?KEY|PRIVATE)", re.IGNORECASE
+)
+
+
+def _blocked_host_dir(host: "Host", resolved: Path) -> bool:
+    """True when ``resolved`` sits inside a host infra dir (secrets/keys)."""
+    for root in (host.secrets_dir, host.keys):
+        try:
+            if resolved == root or resolved.is_relative_to(root):
+                return True
+        except OSError:
+            return True
+    return False
 
 
 def _clean(env: Mapping[str, str], name: str) -> str:
@@ -557,6 +578,56 @@ class Host:
         if found:
             return sorted(found, key=lambda ws: ws.dir.name)[0]
         return self.create("default", label="Default", env=env)
+
+    def update_workspace(
+        self,
+        ws_id: str,
+        *,
+        label: str | None = None,
+        workdir: str | None = _UNSET,
+        workdir_lock: bool | None = None,
+        browser_profile: str | None = _UNSET,
+        env: Mapping[str, str] | None = None,
+    ) -> "Workspace":
+        """Atomically patch ``<ws>/workspace.json`` and return the workspace.
+
+        ``workdir`` is validated: null bytes and paths resolving inside
+        ``<host>/secrets`` or ``<host>/keys`` raise ``ValueError``.
+        ``_UNSET`` leaves a field untouched; ``None``/``""`` clears it.
+        """
+        if not self.workspace_exists(ws_id, env=env):
+            raise ValueError(f"unknown workspace id: {ws_id!r}")
+        ws = self.workspace(ws_id, env=env)
+        meta = _read_meta(ws.dir)
+        if label is not None:
+            clean_label = label.strip()
+            if clean_label:
+                meta["label"] = clean_label
+        if workdir is not _UNSET:
+            if workdir is None or not str(workdir).strip():
+                meta.pop("workdir", None)
+            else:
+                raw = str(workdir).strip()
+                if "\x00" in raw:
+                    raise ValueError("workdir contains null bytes")
+                resolved = _path(raw)
+                if _blocked_host_dir(self, resolved):
+                    raise ValueError(
+                        f"workdir must not resolve inside host secrets/keys: {raw!r}"
+                    )
+                meta["workdir"] = str(resolved)
+        if workdir_lock is not None:
+            if workdir_lock:
+                meta["workdir_lock"] = True
+            else:
+                meta.pop("workdir_lock", None)
+        if browser_profile is not _UNSET:
+            if browser_profile is None or not str(browser_profile).strip():
+                meta.pop("browser_profile", None)
+            else:
+                meta["browser_profile"] = str(browser_profile).strip()
+        _atomic_json_write(ws.workspace_file, meta)
+        return self.workspace(ws_id, env=env)
 
     def delete(
         self,
@@ -947,6 +1018,20 @@ class Workspace:
             return table[key]
         raise KeyError(f"unknown workspace domain: {name}")
 
+    def _foreign_workdir(self, resolved: Path) -> bool:
+        """True when ``resolved`` lives inside another workspace's tree."""
+        base = self.host.workspaces_dir
+        try:
+            inside_pool = resolved == base or resolved.is_relative_to(base)
+        except OSError:
+            return False
+        if not inside_pool:
+            return False
+        try:
+            return not (resolved == self.dir or resolved.is_relative_to(self.dir))
+        except OSError:
+            return True
+
     # --- lifecycle -----------------------------------------------------
 
     def ensure(self) -> "Workspace":
@@ -1065,10 +1150,35 @@ class Workspace:
         for key in allow:
             if key in raw_base and key not in _ENV_KEYS:
                 out[key] = raw_base[key]
-        workdir_p = _path(str(workdir)) if workdir else self.workdir
+        meta = _read_meta(self.dir)
+        cfg_workdir = str(meta.get("workdir") or "").strip()
+        env_workdir = _clean(raw_base, ENV_WORKDIR)
+        if workdir:
+            workdir_p = _path(str(workdir))
+        elif env_workdir and not self._foreign_workdir(_path(env_workdir)):
+            # Explicit caller/env workdir always beats workspace.json; a
+            # path inside a DIFFERENT workspace tree is a foreign leak and
+            # is stripped (C12).
+            workdir_p = _path(env_workdir)
+        elif cfg_workdir:
+            resolved = _path(cfg_workdir)
+            if _blocked_host_dir(self.host, resolved):
+                warnings.warn(
+                    f"workspace {self.id} workdir points inside host "
+                    f"secrets/keys and is ignored: {cfg_workdir!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                workdir_p = self.workdir
+            else:
+                workdir_p = resolved
+        else:
+            workdir_p = self.workdir
         out[ENV_HOST_DIR] = str(self.host.dir)
         out[ENV_WORKSPACE] = self.id
         out[ENV_WORKDIR] = str(workdir_p)
+        if meta.get("workdir_lock") is True and "AGENTS_WORKDIR_LOCK" not in raw_base:
+            out["AGENTS_WORKDIR_LOCK"] = "1"
         if persona:
             out["AGENTS_PERSONA"] = persona
         host = self.host
@@ -1316,6 +1426,74 @@ def read_serve_state(host: Host | None = None) -> dict | None:
             return None
         return {"pid": pid} if pid > 0 else None
     return None
+
+
+def _reject_secret_config_keys(node: Any, trail: str = "") -> None:
+    if isinstance(node, Mapping):
+        for key, val in node.items():
+            name = str(key)
+            if (
+                name in INFRA_SECRET_KEYS
+                or name in LLM_SECRET_KEYS
+                or _SECRETISH_KEY.search(name)
+            ):
+                raise ValueError(
+                    f"secret-like key {trail + name!r} must not be stored "
+                    "in <ws>/config.json; use the host vault"
+                )
+            _reject_secret_config_keys(val, trail + name + ".")
+
+
+def read_workspace_config(ws: Workspace) -> dict:
+    """Read ``<ws>/config.json``: ``{}`` when missing/malformed, ``ValueError``
+    on valid JSON that is not an object."""
+    try:
+        raw = ws.config.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{ws.config} must contain a JSON object")
+    return data
+
+
+def update_workspace_config(
+    ws: Workspace, patch: Mapping[str, Any]
+) -> dict:
+    """Deep-merge ``patch`` into ``<ws>/config.json`` (atomically).
+
+    ``approval.mode`` is validated strictly against
+    ``ALLOWED_APPROVAL_MODES`` (empty clears it). Secret-looking keys are
+    rejected: ``config.json`` holds non-secret policy only.
+    """
+    if not isinstance(patch, Mapping):
+        raise ValueError("config patch must be a mapping")
+    _reject_secret_config_keys(patch)
+    approval = patch.get("approval")
+    if isinstance(approval, Mapping) and "mode" in approval:
+        mode = approval.get("mode")
+        if mode not in (None, "") and mode not in ALLOWED_APPROVAL_MODES:
+            raise ValueError(
+                f"invalid approval.mode {mode!r}; "
+                f"allowed: {', '.join(ALLOWED_APPROVAL_MODES)}"
+            )
+    merged = read_workspace_config(ws)
+
+    def _merge(dst: dict, src: Mapping) -> None:
+        for key, val in src.items():
+            if isinstance(val, Mapping) and isinstance(dst.get(key), dict):
+                _merge(dst[key], val)
+            elif val is None or val == "":
+                dst.pop(key, None)
+            else:
+                dst[key] = val
+
+    _merge(merged, patch)
+    _atomic_json_write(ws.config, merged)
+    return merged
 
 
 def write_serve_state(
