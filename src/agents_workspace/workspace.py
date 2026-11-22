@@ -447,6 +447,11 @@ class Host:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
+            sync_policy=str(meta.get("sync_policy") or "synced"),
+            sync_hosts=tuple(meta.get("sync_hosts") or ()),
+            default_host=str(meta.get("default_host") or ""),
+            repos=tuple(meta.get("repos") or ()),
+            execution=dict(meta.get("execution") or {}),
             source_env=dict(env or {}),
             apply_overrides=False,
         )
@@ -588,6 +593,11 @@ class Host:
         workdir: str | None = _UNSET,
         workdir_lock: bool | None = None,
         browser_profile: str | None = _UNSET,
+        sync_policy: str | None = _UNSET,
+        sync_hosts: list | tuple | None = _UNSET,
+        default_host: str | None = _UNSET,
+        repos: list | tuple | None = _UNSET,
+        execution: Mapping | None = _UNSET,
         env: Mapping[str, str] | None = None,
     ) -> "Workspace":
         """Atomically patch ``<ws>/workspace.json`` and return the workspace.
@@ -627,6 +637,56 @@ class Host:
                 meta.pop("browser_profile", None)
             else:
                 meta["browser_profile"] = str(browser_profile).strip()
+        if sync_policy is not _UNSET:
+            if sync_policy is None or not str(sync_policy).strip():
+                meta.pop("sync_policy", None)
+            else:
+                policy = str(sync_policy).strip()
+                if policy not in ("local", "synced", "shared"):
+                    raise ValueError(
+                        f"sync_policy must be local|synced|shared: {policy!r}")
+                meta["sync_policy"] = policy
+        if sync_hosts is not _UNSET:
+            if not sync_hosts:
+                meta.pop("sync_hosts", None)
+            else:
+                meta["sync_hosts"] = [str(d).strip() for d in sync_hosts
+                                      if str(d).strip()]
+        if default_host is not _UNSET:
+            if default_host is None or not str(default_host).strip():
+                meta.pop("default_host", None)
+            else:
+                meta["default_host"] = str(default_host).strip()
+        if repos is not _UNSET:
+            if not repos:
+                meta.pop("repos", None)
+            else:
+                clean_repos = []
+                for r in repos:
+                    if not isinstance(r, Mapping) or not r.get("slug"):
+                        raise ValueError("repos entries need a 'slug' key")
+                    mode = str(r.get("checkout_mode") or "shared")
+                    if mode not in ("shared", "worktree"):
+                        raise ValueError(
+                            f"checkout_mode must be shared|worktree: {mode!r}")
+                    clean_repos.append(
+                        {"slug": str(r["slug"]),
+                         "url": str(r.get("url") or ""),
+                         "checkout_mode": mode})
+                meta["repos"] = clean_repos
+        if execution is not _UNSET:
+            if not execution:
+                meta.pop("execution", None)
+            else:
+                ex = dict(execution)
+                failover = str(ex.get("failover") or "none")
+                if failover not in ("standby", "none"):
+                    raise ValueError(
+                        f"execution.failover must be standby|none: {failover!r}")
+                ex["failover"] = failover
+                if "lease_sec" in ex:
+                    ex["lease_sec"] = max(1, int(ex["lease_sec"]))
+                meta["execution"] = ex
         _atomic_json_write(ws.workspace_file, meta)
         return self.workspace(ws_id, env=env)
 
@@ -684,6 +744,14 @@ class Workspace:
     parent_workspace: str = ""  # reserved for Track E job workspaces
     isolation: str = ""  # manifest: local | container (runtime.py resolves)
     image: str = ""  # optional container image override
+    # ownership / distribution contract (agents-workspace#43):
+    # local = never emits ops; synced = op-log sync to sync_hosts
+    # (empty = all herd members); shared = reserved multi-user.
+    sync_policy: str = "synced"
+    sync_hosts: tuple = ()
+    default_host: str = ""  # host-picker default (klanker#133)
+    repos: tuple = ()  # [{slug, url, checkout_mode}] — paths stay host-local
+    execution: Mapping = field(default_factory=dict)  # {failover, lease_sec}
     source_env: Mapping[str, str] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -754,6 +822,11 @@ class Workspace:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
+            sync_policy=str(meta.get("sync_policy") or "synced"),
+            sync_hosts=tuple(meta.get("sync_hosts") or ()),
+            default_host=str(meta.get("default_host") or ""),
+            repos=tuple(meta.get("repos") or ()),
+            execution=dict(meta.get("execution") or {}),
             source_env=dict(env),
             apply_overrides=True,
         )

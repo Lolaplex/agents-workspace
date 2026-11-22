@@ -1018,3 +1018,73 @@ class TestWorkspaceStoreContract(unittest.TestCase):
             env_b = ws_b.env(env_a)
             self.assertEqual(env_b["AGENTS_STORE_DB"], str(ws_b.store_db))
             self.assertNotEqual(env_b["AGENTS_STORE_DB"], env_a["AGENTS_STORE_DB"])
+
+
+class TestWorkspaceSyncPolicy(unittest.TestCase):
+    """agents-workspace#43 ownership fields: sync_policy, sync_hosts,
+    default_host, repos, execution — round-trip + validation."""
+
+    def test_defaults_on_fresh_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a")
+            self.assertEqual(ws.sync_policy, "synced")
+            self.assertEqual(ws.sync_hosts, ())
+            self.assertEqual(ws.default_host, "")
+            self.assertEqual(ws.repos, ())
+            self.assertEqual(ws.execution, {})
+
+    def test_round_trip_all_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            ws = host.update_workspace(
+                "a",
+                sync_policy="local",
+                sync_hosts=["dev-1", "dev-2"],
+                default_host="dev-1",
+                repos=[{"slug": "org/app", "url": "git@x:org/app",
+                        "checkout_mode": "worktree"}],
+                execution={"failover": "standby", "lease_sec": 120},
+            )
+            self.assertEqual(ws.sync_policy, "local")
+            self.assertEqual(ws.sync_hosts, ("dev-1", "dev-2"))
+            self.assertEqual(ws.default_host, "dev-1")
+            self.assertEqual(ws.repos[0]["slug"], "org/app")
+            self.assertEqual(ws.repos[0]["checkout_mode"], "worktree")
+            self.assertEqual(ws.execution["failover"], "standby")
+            self.assertEqual(ws.execution["lease_sec"], 120)
+            # re-read from disk
+            ws2 = host.workspace("a")
+            self.assertEqual(ws2.sync_policy, "local")
+            self.assertEqual(ws2.sync_hosts, ("dev-1", "dev-2"))
+
+    def test_validation_rejects_unknown_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", sync_policy="everything")
+            with self.assertRaises(ValueError):
+                host.update_workspace(
+                    "a", repos=[{"slug": "x", "checkout_mode": "mirror"}])
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", repos=[{"no_slug": 1}])
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", execution={"failover": "chaos"})
+
+    def test_clear_fields_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            host.update_workspace("a", sync_policy="local",
+                                  default_host="d1")
+            ws = host.update_workspace("a", sync_policy="synced",
+                                       default_host=None,
+                                       sync_hosts=[], repos=[],
+                                       execution=None)
+            self.assertEqual(ws.sync_policy, "synced")
+            self.assertEqual(ws.default_host, "")
+            self.assertEqual(ws.sync_hosts, ())
+            self.assertEqual(ws.repos, ())
+            self.assertEqual(ws.execution, {})
