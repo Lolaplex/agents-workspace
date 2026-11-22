@@ -7,6 +7,7 @@ from .secrets import (
     doctor,
     expand_secrets,
     list_secret_names,
+    resolve_relay_token,
     secret_inventory,
     secrets_dir,
     secrets_host_file,
@@ -15,6 +16,7 @@ from .secrets import (
 )
 from .workspace import (
     ALL_DOMAINS,
+    ALLOWED_APPROVAL_MODES,
     DIR_DOMAINS,
     DOMAIN_ENV,
     DOMAIN_ENV_ALIASES,
@@ -33,6 +35,7 @@ from .workspace import (
     Host,
     Workspace,
     allowed_roots,
+    clear_serve_state,
     current,
     default_host_dir,
     delegate_depth,
@@ -40,14 +43,19 @@ from .workspace import (
     denied_paths,
     host_config,
     host_dir,
+    read_serve_state,
+    read_workspace_config,
     resolve_secret,
+    update_workspace_config,
     workspace_config,
+    write_serve_state,
 )
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ALL_DOMAINS",
+    "ALLOWED_APPROVAL_MODES",
     "DIR_DOMAINS",
     "DOMAIN_ENV",
     "DOMAIN_ENV_ALIASES",
@@ -68,6 +76,7 @@ __all__ = [
     "Host",
     "Workspace",
     "allowed_roots",
+    "clear_serve_state",
     "current",
     "default_host_dir",
     "delegate_depth",
@@ -79,12 +88,17 @@ __all__ = [
     "host_config",
     "host_dir",
     "list_secret_names",
+    "read_serve_state",
+    "read_workspace_config",
+    "resolve_relay_token",
     "resolve_secret",
     "secret_inventory",
     "secrets_dir",
     "secrets_host_file",
     "secrets_ws_file",
+    "update_workspace_config",
     "workspace_config",
     "write_secret",
+    "write_serve_state",
     "__version__",
 ]

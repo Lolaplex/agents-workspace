@@ -28,6 +28,7 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
     memory/                     # decided (Felix, 10.11.): knowledge only (HARD.md leaves for rules/)
     skills/ modules/ rules/ schedules/ routine-runs/
     relay/ traces/ run/{delegates,procs}/ calendar.json store.db workspace.json work/
+    exports/                    # agents-store markdown/projection exports (sync-safe); raw store.db + *.db-wal/*.db-shm NEVER file-synced
     mcp.json  members.json      # untrusted ws mcp overlay (no ${ENV}); members.json
     personas/<p>/               # AGENTS_PERSONA=<id>; equal; first is 'default'; optional private notes; inbox
       persona.json
@@ -80,6 +81,7 @@ Status: agreed with Felix on 10 Nov 2026 unless marked *(proposal, awaiting Feli
 | `GATEWAY_SECRET/HOST/PORT`, `GatewayConfig` | `RELAY_SECRET/HOST/PORT` | Host | agents-relay, klanker Dockerfile | alias 1 release | C71, C50 |
 | `AGENTS_SESSION_ID` (one per process) | session id = ULID; key stays ws+user+persona (decided (Klanker, technical, 10.11.) D-session-id). Traces import-time store is P1 (D-traces-p1, C31) | Session | agents-traces | P2 (id/key) / P1 (store) | C201, C31 |
 | `AGENTS_SYNC_CONFIG`, `sync_config.json` | keep at workspace level (decided (Klanker, technical, 10.11.) D-sync-config-level); env `AGENTS_SYNC_CONFIG_FILE` (alias `AGENTS_SYNC_CONFIG`, 1 release) (D-file-suffix) | Workspace | agents-sync | keep + rename | C65 |
+| — (new) | `AGENTS_STORE_DB` -> `<ws>/store.db` (`ws.store_db`), projection exports in `<ws>/exports` (`ws.store_exports`) | Workspace | agents-workspace, agents-store | new; raw `*.db`/`*.db-wal`/`*.db-shm` never file-synced, no secrets inside | wave-5 |
 | `node_id`, `host_base_root=~/Coding` | host config, no personal default | Host | agents-sync | move | C65, C100 |
 | `CALDAV_*` env, `<root>/.env` | host `secrets.json` + optional `<ws>/secrets.json` override (decided (Klanker, technical, 10.11.) D-secrets), env = host fallback | Host | agents-calendar | move | C66 |
 | `~/.klanker/daemon.pid` | `<host>/run/serve.pid` | Host | klanker | move | C41, C80 |

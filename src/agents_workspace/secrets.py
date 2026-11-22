@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets as _py_secrets
+import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -247,6 +248,25 @@ def resolve_secret(
         if run_val:
             return run_val
     return ""
+
+
+def resolve_relay_token(
+    host: Host | None = None, env: Mapping[str, str] | None = None
+) -> str:
+    """Shared relay auth token: ``RELAY_SECRET`` > ``RELAY_WEB_TOKEN`` >
+    legacy ``GATEWAY_SECRET`` (with ``DeprecationWarning``)."""
+    for key in ("RELAY_SECRET", "RELAY_WEB_TOKEN"):
+        val = resolve_secret(key, scope="host", host=host, env=env)
+        if val:
+            return val
+    val = resolve_secret("GATEWAY_SECRET", scope="host", host=host, env=env)
+    if val:
+        warnings.warn(
+            "GATEWAY_SECRET is deprecated; use RELAY_SECRET",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return val
 
 
 def _target_vault_file(
