@@ -994,3 +994,27 @@ class TestWorkspaceConfig(unittest.TestCase):
             update_workspace_config(ws, {"model": {"provider": "openai"}})
             out = update_workspace_config(ws, {"model": {"name": "gpt-5"}})
             self.assertEqual(out["model"], {"provider": "openai", "name": "gpt-5"})
+
+
+class TestWorkspaceStoreContract(unittest.TestCase):
+    def test_store_db_isolated_per_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws_a = host.create("a")
+            ws_b = host.create("b")
+            self.assertEqual(ws_a.store_db, ws_a.dir / "store.db")
+            self.assertEqual(ws_b.store_db, ws_b.dir / "store.db")
+            self.assertNotEqual(ws_a.store_db, ws_b.store_db)
+            self.assertEqual(ws_a.store_exports, ws_a.dir / "exports")
+
+    def test_env_sets_and_scrubs_store_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws_a = host.create("a")
+            ws_b = host.create("b")
+            env_a = ws_a.env({})
+            self.assertEqual(env_a["AGENTS_STORE_DB"], str(ws_a.store_db))
+            # Switching workspaces never leaks workspace A's store path.
+            env_b = ws_b.env(env_a)
+            self.assertEqual(env_b["AGENTS_STORE_DB"], str(ws_b.store_db))
+            self.assertNotEqual(env_b["AGENTS_STORE_DB"], env_a["AGENTS_STORE_DB"])

@@ -183,6 +183,7 @@ _ENV_KEYS = frozenset(
         "AGENTS_MCP_CACHE",
         "AGENTS_SYNC_CONFIG_FILE",
         "AGENTS_SYNC_CONFIG",
+        "AGENTS_STORE_DB",
         *REMOVED_ENV,
         *DOMAIN_ENV.values(),
         *DOMAIN_ENV_ALIASES.values(),
@@ -982,6 +983,21 @@ class Workspace:
         return self.dir / "store.db"
 
     @property
+    def store_db(self) -> Path:
+        """Workspace-local agents-store SQLite ``<ws>/store.db``.
+
+        Path contract only — never opened here and never file-synced
+        (raw ``.db``/``.db-wal``/``.db-shm`` stay local). Secrets never
+        live in it; the host vault owns secrets.
+        """
+        return self.dir / "store.db"
+
+    @property
+    def store_exports(self) -> Path:
+        """Markdown/projection export dir ``<ws>/exports`` (sync-safe)."""
+        return self.dir / "exports"
+
+    @property
     def sync_config(self) -> Path:
         return self.dir / "sync_config.json"
 
@@ -1203,6 +1219,7 @@ class Workspace:
             ("AGENTS_MCP_CACHE_FILE", "AGENTS_MCP_CACHE",
              host.cache / "mcp-tools-cache.json"),
             ("AGENTS_SYNC_CONFIG_FILE", "AGENTS_SYNC_CONFIG", self.sync_config),
+            ("AGENTS_STORE_DB", None, self.store_db),
         )
         for new_name, alias, value in pairs:
             out[new_name] = str(value)
