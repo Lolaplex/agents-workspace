@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Host.host_id()` (persisted `<host>/host.json`), `run/serve.json` contract (`read_serve_state`/`write_serve_state` with `host_id`), `resolve_entry_workspace()` deterministic workspace pick, `resolve_relay_token()` vault-aware token resolution (#37).
+- Per-workspace `workdir`/`workdir_lock`/`browser_profile` on `update_workspace()` plus `<ws>/config.json` `approval.mode` (off|ask|strict); `AGENTS_WORKDIR`/`AGENTS_WORKDIR_LOCK` env contract (#38).
+- `ws.store_db`/`ws.store_exports` + `AGENTS_STORE_DB` env ownership for workspace-scoped storage (#39).
+
+### Added
 - Migrate now merges instead of aborting: existing destination dirs merge leaf-by-leaf (new `merge`/`conflict` log kinds), byte-identical duplicates are dropped, and still-colliding entries are quarantined to `<host>/conflicts/<stamp>/` (fully rollback-able via the run log). Half-migrated hosts — where a workspace already holds domain dirs — no longer block `agents-workspace migrate`.
 - Migrate sweeps legacy `~/.klanker` instance payloads: `instances/<id>/workspaces/<ws>` merge into `<host>/workspaces/<ws>`, dead `daemon.pid` files are deleted, and the remaining payload is archived under `<host>/archive/klanker/<id>/`. The live registry (`instance.json`, `relay-secret`, `settings.json`) stays untouched.
 - Host keep-list additions: `providers/` (harness/relay manifests), `voice.json` (host-level TTS config), `AGENTS.md`/`CLAUDE.md` (root inject targets, C62 — previously wrongly moved into the workspace), `archive/` and `conflicts/` (migration output dirs). `voice_inbox/` remaps to `<host>/run/voice_inbox/`, `*.bak-*` entries archive to `<host>/archive/`, a stale empty `workspace/` dir is deleted, and a stale `klanker_prompt.txt` is dropped when the run copy already exists.
