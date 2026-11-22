@@ -669,3 +669,184 @@ class TestRoleScopedEnv(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 ws.env(base, role="bogus")
+
+
+class TestHostIdAndServeState(unittest.TestCase):
+    def test_host_id_persists_and_mints(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            with patch(
+                "agents_workspace.workspace._agents_keys_did", return_value=""
+            ):
+                hid = host.host_id()
+            self.assertTrue(hid.startswith("host_"))
+            self.assertEqual(host.host_id(), hid)
+            data = json.loads(host.agents_json.read_text(encoding="utf-8"))
+            self.assertEqual(data["host_id"], hid)
+
+    def test_host_id_preserves_agents_json_keys(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text(
+                json.dumps({"default_workspace": "alpha"}), encoding="utf-8"
+            )
+            with patch(
+                "agents_workspace.workspace._agents_keys_did", return_value=""
+            ):
+                hid = host.host_id()
+            data = json.loads(host.agents_json.read_text(encoding="utf-8"))
+            self.assertEqual(data["default_workspace"], "alpha")
+            self.assertEqual(data["host_id"], hid)
+
+    def test_host_id_survives_corrupt_agents_json(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text("{corrupt", encoding="utf-8")
+            with patch(
+                "agents_workspace.workspace._agents_keys_did", return_value=""
+            ):
+                hid = host.host_id()
+            self.assertTrue(hid.startswith("host_"))
+            self.assertEqual(host.host_id(), hid)
+
+    def test_host_id_prefers_did_lookup(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            with patch(
+                "agents_workspace.workspace._agents_keys_did",
+                return_value="did:key:z6Mkabc",
+            ):
+                self.assertEqual(host.host_id(), "did:key:z6Mkabc")
+
+    def test_serve_state_roundtrip_and_clear(self):
+        import json
+
+        from agents_workspace import (
+            clear_serve_state,
+            read_serve_state,
+            write_serve_state,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            self.assertIsNone(read_serve_state(host))
+            path = write_serve_state(host, pid=1234, port=8787, url="http://127.0.0.1:8787")
+            self.assertEqual(path, host.run / "serve.json")
+            state = read_serve_state(host)
+            self.assertEqual(state["pid"], 1234)
+            self.assertEqual(state["port"], 8787)
+            self.assertEqual(state["url"], "http://127.0.0.1:8787")
+            self.assertEqual(state["host_id"], host.host_id())
+            # Falsifying: wrong expected pid must not delete the state file.
+            self.assertFalse(clear_serve_state(host, expected_pid=9999))
+            self.assertTrue(path.is_file())
+            self.assertTrue(clear_serve_state(host, expected_pid=1234))
+            self.assertFalse(path.is_file())
+            self.assertFalse(clear_serve_state(host))
+
+    def test_read_serve_state_malformed_and_legacy_pid(self):
+        import warnings
+
+        from agents_workspace import read_serve_state, write_serve_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.run.mkdir(parents=True, exist_ok=True)
+            host.serve_state_path.write_text("{bad", encoding="utf-8")
+            self.assertIsNone(read_serve_state(host))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.run.mkdir(parents=True, exist_ok=True)
+            (host.run / "serve.pid").write_text("4321\n", encoding="utf-8")
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                state = read_serve_state(host)
+            self.assertEqual(state, {"pid": 4321})
+            self.assertTrue(
+                any(w.category is DeprecationWarning for w in seen)
+            )
+
+    def test_write_serve_state_explicit_host_id(self):
+        from agents_workspace import read_serve_state, write_serve_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            write_serve_state(
+                host, pid=1, port=9, url="http://x", host_id="host_fixed"
+            )
+            self.assertEqual(read_serve_state(host)["host_id"], "host_fixed")
+
+
+class TestResolveEntryWorkspace(unittest.TestCase):
+    def test_explicit_env_wins_and_unknown_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("alpha")
+            host.create("beta")
+            ws = host.resolve_entry_workspace({"AGENTS_WORKSPACE": "beta"})
+            self.assertEqual(ws.id, "beta")
+            with self.assertRaises(ValueError):
+                host.resolve_entry_workspace({"AGENTS_WORKSPACE": "missing"})
+
+    def test_default_workspace_config(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("alpha")
+            host.create("beta")
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text(
+                json.dumps({"default_workspace": "beta"}), encoding="utf-8"
+            )
+            self.assertEqual(host.resolve_entry_workspace({}).id, "beta")
+
+    def test_missing_default_falls_through(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("alpha")
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text(
+                json.dumps({"default_workspace": "ghost"}), encoding="utf-8"
+            )
+            # configured-but-missing default must not raise; falls to "alpha"
+            self.assertEqual(host.resolve_entry_workspace({}).id, "alpha")
+
+    def test_multi_workspace_no_default_picks_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("beta")
+            host.create("alpha")
+            # Falsifying: multi-workspace without default must not crash.
+            self.assertEqual(host.resolve_entry_workspace({}).id, "alpha")
+
+    def test_existing_default_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("zzz")
+            host.create("default")
+            self.assertEqual(host.resolve_entry_workspace({}).id, "default")
+
+    def test_empty_host_creates_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.resolve_entry_workspace({})
+            self.assertEqual(ws.id, "default")
+            self.assertTrue(host.workspace_exists("default"))

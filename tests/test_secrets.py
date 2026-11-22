@@ -182,5 +182,56 @@ class TestHostSecretVault(unittest.TestCase):
             )
 
 
+class TestResolveRelayToken(unittest.TestCase):
+    def test_relay_secret_then_web_token_order(self):
+        from agents_workspace import resolve_relay_token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            write_secret("RELAY_SECRET", "rs", host=host, scope="host")
+            write_secret("RELAY_WEB_TOKEN", "wt", host=host, scope="host")
+            self.assertEqual(resolve_relay_token(host=host, env={}), "rs")
+
+    def test_web_token_only_returns_it(self):
+        from agents_workspace import resolve_relay_token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            write_secret("RELAY_WEB_TOKEN", "wt-only", host=host, scope="host")
+            self.assertEqual(resolve_relay_token(host=host, env={}), "wt-only")
+
+    def test_env_relay_secret(self):
+        from agents_workspace import resolve_relay_token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            self.assertEqual(
+                resolve_relay_token(host=host, env={"RELAY_SECRET": "env-rs"}),
+                "env-rs",
+            )
+
+    def test_gateway_secret_legacy_warns(self):
+        import warnings
+
+        from agents_workspace import resolve_relay_token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            write_secret("GATEWAY_SECRET", "legacy-gw", host=host, scope="host")
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                self.assertEqual(resolve_relay_token(host=host, env={}), "legacy-gw")
+            self.assertTrue(
+                any(w.category is DeprecationWarning for w in seen)
+            )
+
+    def test_no_token_returns_empty(self):
+        from agents_workspace import resolve_relay_token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            self.assertEqual(resolve_relay_token(host=host, env={}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

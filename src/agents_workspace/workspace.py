@@ -23,6 +23,8 @@ import re
 import secrets
 import subprocess
 import shutil
+import sys
+import uuid
 import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -348,6 +350,11 @@ class Host:
         return self.dir / "agents.json"
 
     @property
+    def serve_state_path(self) -> Path:
+        """Live-serve state file ``<host>/run/serve.json``."""
+        return self.run / "serve.json"
+
+    @property
     def mcp_json(self) -> Path:
         return self.dir / "mcp.json"
 
@@ -366,6 +373,25 @@ class Host:
     @property
     def host_paths(self) -> Path:
         return self.dir / "host_paths.json"
+
+    def host_id(self) -> str:
+        """Canonical host identity.
+
+        Order: ``agents.json["host_id"]`` > optional ``agents_keys`` DID
+        lookup (never reads private key bytes) > freshly minted
+        ``host_<uuid4hex>`` persisted atomically into ``agents.json``.
+        """
+        existing = host_config(self).get("host_id")
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+        did = _agents_keys_did()
+        if did:
+            return did
+        host_id = f"host_{uuid.uuid4().hex}"
+        data = host_config(self)
+        data["host_id"] = host_id
+        _atomic_json_write(self.agents_json, data)
+        return host_id
 
     def has_legacy_layout(self) -> bool:
         """Host was never migrated: no workspaces/, legacy domains on top."""
@@ -507,6 +533,30 @@ class Host:
             "several workspaces exist; pass a workspace id "
             f"({ENV_WORKSPACE} or --workspace)"
         )
+
+    def resolve_entry_workspace(
+        self, env: Mapping[str, str] | None = None
+    ) -> "Workspace":
+        """Deterministic entry workspace for serve/CLI boot.
+
+        Precedence: explicit ``AGENTS_WORKSPACE`` (strict; unknown id
+        raises) > ``agents.json["default_workspace"]`` when it exists on
+        disk > an existing ``default`` workspace > lexicographically
+        first existing workspace > lazily created ``default``. Never
+        crashes on multi-workspace hosts without a configured default.
+        """
+        env = os.environ if env is None else env
+        if _clean(env, ENV_WORKSPACE):
+            return self.select_workspace(env=env, strict=True)
+        configured = str(host_config(self).get("default_workspace") or "").strip()
+        if configured and self.workspace_exists(configured, env=env):
+            return self.workspace(configured, env=env)
+        if self.workspace_exists("default", env=env):
+            return self.workspace("default", env=env)
+        found = self.list_workspaces(env=env)
+        if found:
+            return sorted(found, key=lambda ws: ws.dir.name)[0]
+        return self.create("default", label="Default", env=env)
 
     def delete(
         self,
@@ -1188,6 +1238,123 @@ def _json_dict(path: Path) -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _atomic_json_write(path: Path, data: Mapping) -> Path:
+    """Atomically write ``data`` as pretty JSON (0600 on POSIX)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    payload = json.dumps(dict(data), indent=2, sort_keys=True) + "\n"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        if os.name != "nt":
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _agents_keys_did() -> str:
+    """Best-effort DID lookup via the optional ``agents_keys`` CLI.
+
+    Delegates any key material handling to ``agents_keys``; this process
+    never reads raw ``.ed25519`` bytes. Returns "" when the package or a
+    host key is unavailable.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "agents_keys", "did", "host"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    for line in (proc.stdout or "").splitlines():
+        cand = line.strip()
+        if cand.startswith("did:key:"):
+            return cand
+    return ""
+
+
+def read_serve_state(host: Host | None = None) -> dict | None:
+    """Read ``<host>/run/serve.json``; ``None`` when missing or malformed.
+
+    Read-only compat fallback: a legacy ``<host>/run/serve.pid`` file
+    (plain PID) is surfaced as ``{"pid": ...}`` with a
+    ``DeprecationWarning``.
+    """
+    target = host or Host.from_env()
+    path = target.serve_state_path
+    if path.is_file():
+        data = _json_dict(path)
+        return data or None
+    legacy = target.run / "serve.pid"
+    if legacy.is_file():
+        warnings.warn(
+            f"legacy serve pid file {legacy} read; move to run/serve.json",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        try:
+            pid = int(legacy.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        return {"pid": pid} if pid > 0 else None
+    return None
+
+
+def write_serve_state(
+    host: Host | None = None,
+    *,
+    pid: int,
+    port: int,
+    url: str,
+    host_id: str | None = None,
+) -> Path:
+    """Atomically write ``<host>/run/serve.json`` and return its path."""
+    target = host or Host.from_env()
+    target.run.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": int(pid),
+        "port": int(port),
+        "url": str(url),
+        "host_id": host_id or target.host_id(),
+    }
+    return _atomic_json_write(target.serve_state_path, payload)
+
+
+def clear_serve_state(
+    host: Host | None = None, *, expected_pid: int | None = None
+) -> bool:
+    """Remove ``serve.json``; with ``expected_pid`` only on pid match."""
+    target = host or Host.from_env()
+    path = target.serve_state_path
+    if not path.is_file():
+        return False
+    if expected_pid is not None:
+        data = _json_dict(path)
+        if data.get("pid") != expected_pid:
+            return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def resolve_secret(
