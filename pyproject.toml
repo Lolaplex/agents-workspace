@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agents-workspace"
-version = "0.1.0"
+version = "0.2.0"
 description = "One root for every agents domain: memory, traces, schedules, personas, relay state"
 readme = "README.md"
 license = "MIT"
