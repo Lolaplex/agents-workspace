@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -1088,3 +1089,44 @@ class TestWorkspaceSyncPolicy(unittest.TestCase):
             self.assertEqual(ws.sync_hosts, ())
             self.assertEqual(ws.repos, ())
             self.assertEqual(ws.execution, {})
+
+
+class TestWorkspaceSyncHostsValidation(unittest.TestCase):
+    """sync_hosts = hub device-id allowlist: strict on write, tolerant on read."""
+
+    def test_rejects_non_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            for bad in ("dev-1", b"dev-1", {"dev-1": True}, 5):
+                with self.assertRaises(ValueError):
+                    host.update_workspace("a", sync_hosts=bad)
+
+    def test_rejects_bad_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            for bad in ([1], ["ok", None], [""], ["has space"], ["../x"],
+                        ["x" * 200]):
+                with self.assertRaises(ValueError):
+                    host.update_workspace("a", sync_hosts=bad)
+
+    def test_strips_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            ws = host.update_workspace(
+                "a", sync_hosts=[" d1 ", "d1", "a1b2c3d4e5f60718"])
+            self.assertEqual(ws.sync_hosts, ("d1", "a1b2c3d4e5f60718"))
+
+    def test_hand_edited_bad_value_does_not_crash_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a")
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_hosts"] = "dev-1"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(host.workspace("a").sync_hosts, ())
+            meta["sync_hosts"] = ["ok-1", 7, "bad id"]
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            self.assertEqual(host.workspace("a").sync_hosts, ("ok-1",))

@@ -315,6 +315,49 @@ def _read_meta(root: Path) -> dict:
     return _json_dict(root / "workspace.json")
 
 
+# sync_hosts entries are peer ids *as the sync hub sees them*: the channel
+# device id the hub minted at pairing (agents-relay ``/v1/hub/devices``).
+# They are NOT Host.host_id() values -- ``default_host`` is the host-picker
+# id; ``sync_hosts`` is the hub fan-out allowlist. Empty = every paired
+# device of the herd.
+_PEER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+
+
+def _validate_sync_hosts(value) -> list[str]:
+    """Strict write-side validation: list/tuple of peer-id strings."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping) \
+            or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "sync_hosts must be a list of hub device ids, got "
+            f"{type(value).__name__}")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"sync_hosts entries must be strings: {item!r}")
+        peer = item.strip()
+        if not _PEER_ID_RE.match(peer):
+            raise ValueError(f"invalid sync_hosts device id: {item!r}")
+        if peer not in out:
+            out.append(peer)
+    return out
+
+
+def _read_sync_hosts(value) -> tuple:
+    """Tolerant read-side parse: a hand-edited bad value never crashes
+    workspace loading; invalid entries are dropped."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and _PEER_ID_RE.match(item.strip()) \
+                and item.strip() not in out:
+            out.append(item.strip())
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Host:
     """Infra level: keys, secrets, run, cache, logs, clients. No memory/skills."""
@@ -448,7 +491,7 @@ class Host:
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
             sync_policy=str(meta.get("sync_policy") or "synced"),
-            sync_hosts=tuple(meta.get("sync_hosts") or ()),
+            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
             default_host=str(meta.get("default_host") or ""),
             repos=tuple(meta.get("repos") or ()),
             execution=dict(meta.get("execution") or {}),
@@ -647,11 +690,11 @@ class Host:
                         f"sync_policy must be local|synced|shared: {policy!r}")
                 meta["sync_policy"] = policy
         if sync_hosts is not _UNSET:
-            if not sync_hosts:
+            clean_hosts = _validate_sync_hosts(sync_hosts)
+            if not clean_hosts:
                 meta.pop("sync_hosts", None)
             else:
-                meta["sync_hosts"] = [str(d).strip() for d in sync_hosts
-                                      if str(d).strip()]
+                meta["sync_hosts"] = clean_hosts
         if default_host is not _UNSET:
             if default_host is None or not str(default_host).strip():
                 meta.pop("default_host", None)
@@ -745,8 +788,9 @@ class Workspace:
     isolation: str = ""  # manifest: local | container (runtime.py resolves)
     image: str = ""  # optional container image override
     # ownership / distribution contract (agents-workspace#43):
-    # local = never emits ops; synced = op-log sync to sync_hosts
-    # (empty = all herd members); shared = reserved multi-user.
+    # local = never emits ops; synced = op-log sync to sync_hosts, the
+    # hub channel device ids (empty = all herd members; NOT host ids --
+    # see _validate_sync_hosts); shared = reserved multi-user.
     sync_policy: str = "synced"
     sync_hosts: tuple = ()
     default_host: str = ""  # host-picker default (klanker#133)
@@ -823,7 +867,7 @@ class Workspace:
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
             sync_policy=str(meta.get("sync_policy") or "synced"),
-            sync_hosts=tuple(meta.get("sync_hosts") or ()),
+            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
             default_host=str(meta.get("default_host") or ""),
             repos=tuple(meta.get("repos") or ()),
             execution=dict(meta.get("execution") or {}),
