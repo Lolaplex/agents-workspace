@@ -315,6 +315,49 @@ def _read_meta(root: Path) -> dict:
     return _json_dict(root / "workspace.json")
 
 
+# sync_hosts entries are peer ids *as the sync hub sees them*: the channel
+# device id the hub minted at pairing (agents-relay ``/v1/hub/devices``).
+# They are NOT Host.host_id() values -- ``default_host`` is the host-picker
+# id; ``sync_hosts`` is the hub fan-out allowlist. Empty = every paired
+# device of the herd.
+_PEER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+
+
+def _validate_sync_hosts(value) -> list[str]:
+    """Strict write-side validation: list/tuple of peer-id strings."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping) \
+            or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "sync_hosts must be a list of hub device ids, got "
+            f"{type(value).__name__}")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"sync_hosts entries must be strings: {item!r}")
+        peer = item.strip()
+        if not _PEER_ID_RE.match(peer):
+            raise ValueError(f"invalid sync_hosts device id: {item!r}")
+        if peer not in out:
+            out.append(peer)
+    return out
+
+
+def _read_sync_hosts(value) -> tuple:
+    """Tolerant read-side parse: a hand-edited bad value never crashes
+    workspace loading; invalid entries are dropped."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and _PEER_ID_RE.match(item.strip()) \
+                and item.strip() not in out:
+            out.append(item.strip())
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Host:
     """Infra level: keys, secrets, run, cache, logs, clients. No memory/skills."""
@@ -447,6 +490,11 @@ class Host:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
+            sync_policy=str(meta.get("sync_policy") or "synced"),
+            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
+            default_host=str(meta.get("default_host") or ""),
+            repos=tuple(meta.get("repos") or ()),
+            execution=dict(meta.get("execution") or {}),
             source_env=dict(env or {}),
             apply_overrides=False,
         )
@@ -588,6 +636,11 @@ class Host:
         workdir: str | None = _UNSET,
         workdir_lock: bool | None = None,
         browser_profile: str | None = _UNSET,
+        sync_policy: str | None = _UNSET,
+        sync_hosts: list | tuple | None = _UNSET,
+        default_host: str | None = _UNSET,
+        repos: list | tuple | None = _UNSET,
+        execution: Mapping | None = _UNSET,
         env: Mapping[str, str] | None = None,
     ) -> "Workspace":
         """Atomically patch ``<ws>/workspace.json`` and return the workspace.
@@ -627,6 +680,56 @@ class Host:
                 meta.pop("browser_profile", None)
             else:
                 meta["browser_profile"] = str(browser_profile).strip()
+        if sync_policy is not _UNSET:
+            if sync_policy is None or not str(sync_policy).strip():
+                meta.pop("sync_policy", None)
+            else:
+                policy = str(sync_policy).strip()
+                if policy not in ("local", "synced", "shared"):
+                    raise ValueError(
+                        f"sync_policy must be local|synced|shared: {policy!r}")
+                meta["sync_policy"] = policy
+        if sync_hosts is not _UNSET:
+            clean_hosts = _validate_sync_hosts(sync_hosts)
+            if not clean_hosts:
+                meta.pop("sync_hosts", None)
+            else:
+                meta["sync_hosts"] = clean_hosts
+        if default_host is not _UNSET:
+            if default_host is None or not str(default_host).strip():
+                meta.pop("default_host", None)
+            else:
+                meta["default_host"] = str(default_host).strip()
+        if repos is not _UNSET:
+            if not repos:
+                meta.pop("repos", None)
+            else:
+                clean_repos = []
+                for r in repos:
+                    if not isinstance(r, Mapping) or not r.get("slug"):
+                        raise ValueError("repos entries need a 'slug' key")
+                    mode = str(r.get("checkout_mode") or "shared")
+                    if mode not in ("shared", "worktree"):
+                        raise ValueError(
+                            f"checkout_mode must be shared|worktree: {mode!r}")
+                    clean_repos.append(
+                        {"slug": str(r["slug"]),
+                         "url": str(r.get("url") or ""),
+                         "checkout_mode": mode})
+                meta["repos"] = clean_repos
+        if execution is not _UNSET:
+            if not execution:
+                meta.pop("execution", None)
+            else:
+                ex = dict(execution)
+                failover = str(ex.get("failover") or "none")
+                if failover not in ("standby", "none"):
+                    raise ValueError(
+                        f"execution.failover must be standby|none: {failover!r}")
+                ex["failover"] = failover
+                if "lease_sec" in ex:
+                    ex["lease_sec"] = max(1, int(ex["lease_sec"]))
+                meta["execution"] = ex
         _atomic_json_write(ws.workspace_file, meta)
         return self.workspace(ws_id, env=env)
 
@@ -684,6 +787,15 @@ class Workspace:
     parent_workspace: str = ""  # reserved for Track E job workspaces
     isolation: str = ""  # manifest: local | container (runtime.py resolves)
     image: str = ""  # optional container image override
+    # ownership / distribution contract (agents-workspace#43):
+    # local = never emits ops; synced = op-log sync to sync_hosts, the
+    # hub channel device ids (empty = all herd members; NOT host ids --
+    # see _validate_sync_hosts); shared = reserved multi-user.
+    sync_policy: str = "synced"
+    sync_hosts: tuple = ()
+    default_host: str = ""  # host-picker default (klanker#133)
+    repos: tuple = ()  # [{slug, url, checkout_mode}] — paths stay host-local
+    execution: Mapping = field(default_factory=dict)  # {failover, lease_sec}
     source_env: Mapping[str, str] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -754,6 +866,11 @@ class Workspace:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
+            sync_policy=str(meta.get("sync_policy") or "synced"),
+            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
+            default_host=str(meta.get("default_host") or ""),
+            repos=tuple(meta.get("repos") or ()),
+            execution=dict(meta.get("execution") or {}),
             source_env=dict(env),
             apply_overrides=True,
         )
