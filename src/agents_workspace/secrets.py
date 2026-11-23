@@ -13,9 +13,12 @@ from typing import Any, Mapping
 from .workspace import (
     ENV_WORKSPACE,
     INFRA_SECRET_KEYS,
+    LLM_SECRET_KEYS,
     Host,
     Workspace,
     _json_dict,
+    _PEER_ID_RE,
+    _SECRETISH_KEY,
     default_host_dir,
     host_config,
 )
@@ -186,10 +189,25 @@ def resolve_secret(
     ``ws-<id>.json > legacy <ws>/secrets.json > keyring > host.json > ENV``,
     flipped to ``ENV > /run/secrets > ws-<id>.json > ...`` when
     ``AGENTS_SECRETS_ORDER=env-first``.
+
+    ``scope="workspace"`` is a hard boundary: it searches ONLY
+    ``<ws>/secrets.json`` — never the host vault (``host.json``,
+    ``ws-<id>.json``), the legacy ``<host>/secrets.json``, the OS keyring,
+    ``/run/secrets``, or process env — and never resolves
+    ``INFRA_SECRET_KEYS``.
     """
     if scope not in _SCOPES:
         raise ValueError(f"invalid secret scope: {scope!r}")
     env_map = os.environ if env is None else env
+    if scope == "workspace":
+        if key in INFRA_SECRET_KEYS:
+            return ""
+        _, target_ws = _resolve_target(
+            ws=ws, host=host, env=env_map, need_ws=True
+        )
+        if target_ws is None:
+            return ""
+        return _read_key_from_json(target_ws.secrets, key)
     infra_only = scope == "host" or key in INFRA_SECRET_KEYS
     target_host, target_ws = _resolve_target(
         ws=ws, host=host, env=env_map, need_ws=not infra_only
@@ -393,29 +411,41 @@ def expand_secrets(
     host: Host | None = None,
     env: Mapping[str, str] | None = None,
     trusted: bool = False,
+    scope: str = "auto",
 ) -> Any:
     """Recursively expand ``${VAR}`` / ``${VAR:-default}`` ONLY when ``trusted=True``.
 
     Untrusted inputs (such as workspace-local ``mcp.json``) are returned untouched.
+    ``scope`` is forwarded to ``resolve_secret``; expanding workspace
+    manifests (``scope="workspace"``) never expands ``INFRA_SECRET_KEYS``
+    (RELAY_SECRET, TELEGRAM_BOT_TOKEN, ...).
     """
     if not trusted:
         return obj
+    if scope not in _SCOPES:
+        raise ValueError(f"invalid secret scope: {scope!r}")
+
+    def _resolve_var(var: str) -> str:
+        if scope == "workspace" and var in INFRA_SECRET_KEYS:
+            return ""
+        return resolve_secret(var, ws=ws, host=host, env=env, scope=scope)
+
     if isinstance(obj, str):
         def _sub(match: re.Match[str]) -> str:
             var, default = match.group(1), match.group(2)
-            val = resolve_secret(var, ws=ws, host=host, env=env)
+            val = _resolve_var(var)
             if val:
                 return val
             return default if default is not None else ""
 
         return _EXPAND_RE.sub(_sub, obj)
     if isinstance(obj, list):
-        return [expand_secrets(item, ws=ws, host=host, env=env, trusted=True) for item in obj]
+        return [expand_secrets(item, ws=ws, host=host, env=env, trusted=True, scope=scope) for item in obj]
     if isinstance(obj, tuple):
-        return tuple(expand_secrets(item, ws=ws, host=host, env=env, trusted=True) for item in obj)
+        return tuple(expand_secrets(item, ws=ws, host=host, env=env, trusted=True, scope=scope) for item in obj)
     if isinstance(obj, dict):
         return {
-            str(k): expand_secrets(v, ws=ws, host=host, env=env, trusted=True)
+            str(k): expand_secrets(v, ws=ws, host=host, env=env, trusted=True, scope=scope)
             for k, v in obj.items()
         }
     return obj
@@ -550,6 +580,76 @@ def _eval_doctor_check(
         _add_issue(issues, severity, path, message)
 
 
+def _secretish_keys_in(node: Any, trail: str = "") -> list[str]:
+    """Dotted names of secret-looking keys inside a parsed JSON doc."""
+    out: list[str] = []
+    if isinstance(node, Mapping):
+        for key, val in node.items():
+            name = str(key)
+            if (
+                name in INFRA_SECRET_KEYS
+                or name in LLM_SECRET_KEYS
+                or _SECRETISH_KEY.search(name)
+            ):
+                out.append(trail + name)
+            out.extend(_secretish_keys_in(val, trail + name + "."))
+    return out
+
+
+def _audit_ws_meta(issues: list[dict[str, str]], ws: Workspace) -> None:
+    """Flag malformed ownership fields and leaked secret-like keys inside
+    ``<ws>/workspace.json`` and ``<ws>/config.json``."""
+    meta_path = ws.workspace_file
+    if meta_path.is_file():
+        meta = _json_dict(meta_path)
+        raw_policy = meta.get("sync_policy")
+        if raw_policy is not None and (
+            not isinstance(raw_policy, str)
+            or raw_policy.strip().lower() not in ("local", "synced", "shared", "")
+        ):
+            _add_issue(
+                issues,
+                "medium",
+                meta_path,
+                f"malformed sync_policy in workspace.json: {raw_policy!r}",
+            )
+        raw_hosts = meta.get("sync_hosts")
+        if raw_hosts is not None:
+            bad_hosts = not isinstance(raw_hosts, list) or any(
+                not isinstance(item, str)
+                or not _PEER_ID_RE.match(item.strip())
+                for item in raw_hosts
+            )
+            if bad_hosts:
+                _add_issue(
+                    issues,
+                    "medium",
+                    meta_path,
+                    "malformed sync_hosts in workspace.json "
+                    "(fails closed to no remote devices)",
+                )
+        if ws.policy_error:
+            _add_issue(
+                issues,
+                "medium",
+                meta_path,
+                "malformed ownership field(s) in workspace.json; "
+                "workspace fails closed",
+            )
+    for path in (meta_path, ws.config):
+        if not path.is_file():
+            continue
+        hits = _secretish_keys_in(_json_dict(path))
+        if hits:
+            _add_issue(
+                issues,
+                "high",
+                path,
+                f"secret-like keys in {path.name}: "
+                + ", ".join(sorted(hits)[:5]),
+            )
+
+
 def doctor(
     host: Host | None = None, *, env: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -601,6 +701,7 @@ def doctor(
             )
 
     for ws in workspaces:
+        _audit_ws_meta(issues, ws)
         if ws.secrets.is_file() and _json_dict(ws.secrets):
             _add_issue(
                 issues,

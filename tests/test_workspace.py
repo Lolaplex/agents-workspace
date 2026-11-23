@@ -934,14 +934,20 @@ class TestWorkspaceWorkdirSchema(unittest.TestCase):
             self.assertEqual(env["AGENTS_WORKDIR"], str(ws.dir / "work"))
             self.assertTrue(any(w.category is UserWarning for w in seen))
 
-    def test_caller_workdir_lock_preserved(self):
+    def test_workdir_lock_is_resolver_owned_and_never_leaks(self):
         with tempfile.TemporaryDirectory() as tmp:
             host = Host.open(tmp)
             ws = host.update_workspace(
                 host.create("a").id, workdir_lock=True
             )
+            # AGENTS_WORKDIR_LOCK is resolver-owned (_ENV_KEYS): a caller
+            # value can never disable a meta-locked workdir or leak into
+            # another workspace's child env.
             env = ws.env({"AGENTS_WORKDIR_LOCK": "0"})
-            self.assertEqual(env["AGENTS_WORKDIR_LOCK"], "0")
+            self.assertEqual(env["AGENTS_WORKDIR_LOCK"], "1")
+            ws_b = host.create("b")
+            env_b = ws_b.env(env)
+            self.assertNotIn("AGENTS_WORKDIR_LOCK", env_b)
 
 
 class TestWorkspaceConfig(unittest.TestCase):
@@ -1029,11 +1035,16 @@ class TestWorkspaceSyncPolicy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             host = Host.open(tmp)
             ws = host.create("a")
-            self.assertEqual(ws.sync_policy, "synced")
+            # Fail-closed (agents-workspace#44): absent policy = "local",
+            # empty sync_hosts = CLOSED (zero remote devices).
+            self.assertEqual(ws.sync_policy, "local")
             self.assertEqual(ws.sync_hosts, ())
             self.assertEqual(ws.default_host, "")
             self.assertEqual(ws.repos, ())
             self.assertEqual(ws.execution, {})
+            self.assertFalse(ws.is_syncable())
+            self.assertFalse(ws.allows_device("dev1"))
+            self.assertFalse(ws.policy_error)
 
     def test_round_trip_all_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1041,24 +1052,53 @@ class TestWorkspaceSyncPolicy(unittest.TestCase):
             host.create("a")
             ws = host.update_workspace(
                 "a",
-                sync_policy="local",
+                sync_policy="synced",
                 sync_hosts=["dev-1", "dev-2"],
                 default_host="dev-1",
                 repos=[{"slug": "org/app", "url": "git@x:org/app",
                         "checkout_mode": "worktree"}],
                 execution={"failover": "standby", "lease_sec": 120},
             )
-            self.assertEqual(ws.sync_policy, "local")
+            self.assertEqual(ws.sync_policy, "synced")
             self.assertEqual(ws.sync_hosts, ("dev-1", "dev-2"))
             self.assertEqual(ws.default_host, "dev-1")
             self.assertEqual(ws.repos[0]["slug"], "org/app")
             self.assertEqual(ws.repos[0]["checkout_mode"], "worktree")
             self.assertEqual(ws.execution["failover"], "standby")
             self.assertEqual(ws.execution["lease_sec"], 120)
+            self.assertTrue(ws.is_syncable())
+            self.assertTrue(ws.allows_device("dev-1"))
+            self.assertFalse(ws.allows_device("dev-3"))
             # re-read from disk
             ws2 = host.workspace("a")
-            self.assertEqual(ws2.sync_policy, "local")
+            self.assertEqual(ws2.sync_policy, "synced")
             self.assertEqual(ws2.sync_hosts, ("dev-1", "dev-2"))
+            self.assertTrue(ws2.allows_device("dev-2"))
+
+    def test_local_plus_sync_hosts_raises(self):
+        """Invariant: policy 'local' can never carry an allowlist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a")
+            self.assertEqual(ws.sync_policy, "local")
+            with self.assertRaises(ValueError):
+                host.update_workspace("a", sync_hosts=["dev-1"])
+            with self.assertRaises(ValueError):
+                host.create("b", sync_hosts=["dev-1"])
+            with self.assertRaises(ValueError):
+                host.create("c", sync_policy="local", sync_hosts=["dev-1"])
+            host.create("d", sync_policy="synced", sync_hosts=["dev-1"])
+            self.assertTrue(host.workspace("d").allows_device("dev-1"))
+            # switching a synced ws back to local while hosts set -> raise
+            host.update_workspace("d", sync_hosts=["dev-1"])
+            with self.assertRaises(ValueError):
+                host.update_workspace("d", sync_policy="local")
+            # ...unless the allowlist is cleared in the same write
+            ws_d = host.update_workspace(
+                "d", sync_policy="local", sync_hosts=[])
+            self.assertEqual(ws_d.sync_policy, "local")
+            self.assertEqual(ws_d.sync_hosts, ())
+            self.assertFalse(ws_d.is_syncable())
 
     def test_validation_rejects_unknown_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1091,8 +1131,246 @@ class TestWorkspaceSyncPolicy(unittest.TestCase):
             self.assertEqual(ws.execution, {})
 
 
+class TestFailClosedPolicyModel(unittest.TestCase):
+    """agents-workspace#44: fail-closed sync policy, strict ownership
+    validation, host identity isolation, and host_paths.json helpers."""
+
+    def test_private_workspace_defaults_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("priv")
+            self.assertEqual(ws.sync_policy, "local")
+            self.assertEqual(ws.sync_hosts, ())
+            self.assertFalse(ws.is_syncable())
+            self.assertFalse(ws.allows_device("dev1"))
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            self.assertEqual(meta["sync_policy"], "local")
+            self.assertNotIn("sync_hosts", meta)
+
+    def test_corrupt_sync_hosts_typo_never_widens(self):
+        """`"sync_hosts": "my-laptop"` fails closed — zero devices allowed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a", sync_policy="synced", sync_hosts=["ok-1"])
+            self.assertTrue(ws.allows_device("ok-1"))
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_hosts"] = "my-laptop"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bad = host.workspace("a")
+            self.assertEqual(bad.sync_hosts, ())
+            self.assertTrue(bad.policy_error)
+            self.assertFalse(bad.allows_device("any"))
+            self.assertFalse(bad.allows_device("ok-1"))
+
+    def test_invalid_sync_policy_string_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a", sync_policy="synced", sync_hosts=["ok-1"])
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_policy"] = "everything"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                bad = host.workspace("a")
+            self.assertEqual(bad.sync_policy, "local")
+            self.assertFalse(bad.is_syncable())
+            self.assertFalse(bad.allows_device("ok-1"))
+            self.assertTrue(
+                any("failing closed" in str(w.message) for w in seen)
+            )
+            # case-insensitive normalization on read
+            meta["sync_policy"] = "Synced"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.assertEqual(host.workspace("a").sync_policy, "synced")
+
+    def test_ad_hoc_open_and_to_dict_preserve_ownership_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create(
+                "a",
+                sync_policy="synced",
+                sync_hosts=["dev-1"],
+                default_host="dh-1",
+                repos=[{"slug": "org/app", "url": "git@x:org/app"}],
+                execution={"failover": "standby", "lease_sec": 60},
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                adhoc = Workspace.open(ws.dir)
+            for f in (
+                "sync_policy", "sync_hosts", "default_host",
+                "repos", "execution",
+            ):
+                self.assertEqual(getattr(adhoc, f), getattr(ws, f), f)
+            d = adhoc.to_dict()
+            self.assertEqual(d["sync_policy"], "synced")
+            self.assertEqual(d["sync_hosts"], ["dev-1"])
+            self.assertEqual(d["default_host"], "dh-1")
+            self.assertEqual(d["repos"][0]["slug"], "org/app")
+            self.assertEqual(d["execution"]["lease_sec"], 60)
+            self.assertTrue(adhoc.allows_device("dev-1"))
+
+    def test_malformed_meta_fields_never_crash_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a")
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["execution"] = "bad"
+            meta["repos"] = 5
+            meta["default_host"] = {"x": 1}
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ws2 = host.workspace("a")
+            self.assertEqual(
+                ws2.execution, {"failover": "none", "lease_sec": 45})
+            self.assertEqual(ws2.repos, ())
+            self.assertEqual(ws2.default_host, "")
+            self.assertTrue(ws2.policy_error)
+
+    def test_execution_strict_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            for bad in (
+                {"lease_sec": True},
+                {"lease_sec": 5},
+                {"lease_sec": 4000},
+                {"lease_sec": "120"},
+                {"failover": "chaos"},
+                {"owner": "bad id"},
+                {"owner": 5},
+                {"API_KEY": "x"},
+                {"nested_secret": {"MY_TOKEN": "x"}},
+                {"bogus": 1},
+                "not-a-dict",
+            ):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    host.update_workspace("a", execution=bad)
+            ws = host.update_workspace(
+                "a",
+                execution={"owner": "dev-1", "failover": "standby",
+                           "lease_sec": 120},
+            )
+            self.assertEqual(ws.execution["owner"], "dev-1")
+            self.assertEqual(ws.execution["failover"], "standby")
+            self.assertEqual(ws.execution["lease_sec"], 120)
+            # malformed stored execution falls back safely
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["execution"] = {"lease_sec": -3, "junk": 1}
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ws2 = host.workspace("a")
+            self.assertEqual(ws2.execution["lease_sec"], 45)
+            self.assertNotIn("junk", ws2.execution)
+            self.assertTrue(ws2.policy_error)
+
+    def test_default_host_strict_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            for bad in (5, {"x": 1}, "has space", "-lead", "x" * 65, "..x"):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    host.update_workspace("a", default_host=bad)
+            ws = host.update_workspace("a", default_host="dev_1.X-9")
+            self.assertEqual(ws.default_host, "dev_1.X-9")
+
+    def test_repos_strict_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            for bad in (
+                5,
+                "org/app",
+                [{"slug": "a", "path": "/tmp/checkout"}],
+                [{"slug": "../x"}],
+                [{"slug": "has space"}],
+                [{"slug": ""}],
+                [{"no_slug": 1}],
+                [{"slug": "dup"}, {"slug": "dup"}],
+                [{"slug": "ok", "checkout_mode": "mirror"}],
+            ):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    host.update_workspace("a", repos=bad)
+            ws = host.update_workspace(
+                "a", repos=[{"slug": "org/app", "url": "git@x:org/app"}])
+            self.assertEqual(ws.repos[0]["slug"], "org/app")
+            self.assertEqual(ws.repos[0]["checkout_mode"], "shared")
+
+    def test_host_paths_roundtrip_and_denied(self):
+        from agents_workspace import denied_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws = host.create("a")
+            self.assertIn(host.host_paths, denied_paths(ws))
+            self.assertEqual(host.read_host_paths(), {})
+            host.set_host_repo_path("org/app", "/checkouts/app")
+            host.set_host_repo_path("org/priv", "D:/priv", ws_id="a")
+            data = host.read_host_paths()
+            self.assertEqual(data[""]["org/app"], "/checkouts/app")
+            self.assertEqual(data["a"]["org/priv"], "D:/priv")
+            self.assertEqual(
+                host.resolve_repo_path("org/app"), Path("/checkouts/app"))
+            self.assertEqual(
+                host.resolve_repo_path("org/priv", ws_id="a"), Path("D:/priv"))
+            self.assertIsNone(host.resolve_repo_path("org/priv", ws_id="b"))
+            self.assertIsNone(host.resolve_repo_path("missing"))
+            with self.assertRaises(ValueError):
+                host.set_host_repo_path("../x", "/p")
+            with self.assertRaises(ValueError):
+                host.set_host_repo_path("ok", "")
+            host.host_paths.write_text("{bad", encoding="utf-8")
+            self.assertEqual(host.read_host_paths(), {})
+
+    def test_host_id_never_reads_real_user_keys(self):
+        """Isolated Host(tmp) pins AGENTS_HOST_DIR/AGENTS_KEYS_DIR for the
+        agents_keys subprocess — the real ~/.agents DID can never leak in."""
+        import subprocess as sp
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            seen = {}
+
+            def fake_run(cmd, **kw):
+                seen["env"] = kw.get("env") or {}
+                return sp.CompletedProcess(cmd, 1, "", "")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                hid = host.host_id()
+            env = seen["env"]
+            self.assertEqual(env["AGENTS_HOST_DIR"], str(host.dir))
+            self.assertEqual(env["AGENTS_KEYS_DIR"], str(host.keys))
+            self.assertNotEqual(
+                env["AGENTS_HOST_DIR"], str(Path.home() / ".agents"))
+            self.assertTrue(hid.startswith("host_"))
+
+    def test_sync_node_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.dir.mkdir(parents=True, exist_ok=True)
+            host.agents_json.write_text(
+                json.dumps({"host_id": "did:key:z6Mkabc:def"}),
+                encoding="utf-8",
+            )
+            nid = host.sync_node_id()
+            self.assertRegex(nid, r"^k_[0-9a-f]{16}$")
+            self.assertNotIn(":", nid)
+            self.assertEqual(host.sync_node_id(), nid)  # stable
+            host.agents_json.write_text(
+                json.dumps({"host_id": "dev-1"}), encoding="utf-8")
+            self.assertEqual(host.sync_node_id(), "dev-1")
+
+
 class TestWorkspaceSyncHostsValidation(unittest.TestCase):
-    """sync_hosts = hub device-id allowlist: strict on write, tolerant on read."""
+    """sync_hosts = hub device-id allowlist: strict on write, fail-closed on read."""
 
     def test_rejects_non_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1116,17 +1394,39 @@ class TestWorkspaceSyncHostsValidation(unittest.TestCase):
             host = Host.open(tmp)
             host.create("a")
             ws = host.update_workspace(
-                "a", sync_hosts=[" d1 ", "d1", "a1b2c3d4e5f60718"])
+                "a", sync_policy="synced",
+                sync_hosts=[" d1 ", "d1", "a1b2c3d4e5f60718"])
             self.assertEqual(ws.sync_hosts, ("d1", "a1b2c3d4e5f60718"))
 
-    def test_hand_edited_bad_value_does_not_crash_read(self):
+    def test_hand_edited_bad_value_fails_closed(self):
+        """A hand-edit typo must never widen access (agents-workspace#44):
+        any malformed sync_hosts shape fails closed to () + policy_error."""
         with tempfile.TemporaryDirectory() as tmp:
             host = Host.open(tmp)
             ws = host.create("a")
             meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_policy"] = "synced"
             meta["sync_hosts"] = "dev-1"
             ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
-            self.assertEqual(host.workspace("a").sync_hosts, ())
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bad = host.workspace("a")
+            self.assertEqual(bad.sync_hosts, ())
+            self.assertTrue(bad.policy_error)
+            self.assertFalse(bad.allows_device("dev-1"))
             meta["sync_hosts"] = ["ok-1", 7, "bad id"]
             ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
-            self.assertEqual(host.workspace("a").sync_hosts, ("ok-1",))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bad2 = host.workspace("a")
+            # partial validity is still a failure: the whole list fails closed
+            self.assertEqual(bad2.sync_hosts, ())
+            self.assertTrue(bad2.policy_error)
+            self.assertFalse(bad2.allows_device("ok-1"))
+            # a clean allowlist still reads through
+            meta["sync_hosts"] = ["ok-1"]
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            good = host.workspace("a")
+            self.assertEqual(good.sync_hosts, ("ok-1",))
+            self.assertFalse(good.policy_error)
+            self.assertTrue(good.allows_device("ok-1"))

@@ -17,6 +17,7 @@ Nothing here touches the network or starts a process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -184,6 +185,9 @@ _ENV_KEYS = frozenset(
         "AGENTS_SYNC_CONFIG_FILE",
         "AGENTS_SYNC_CONFIG",
         "AGENTS_STORE_DB",
+        "AGENTS_WORKDIR_LOCK",
+        "AGENTS_WORKDIR_ALLOW",
+        "AGENTS_WORKSPACE_ALLOW",
         *REMOVED_ENV,
         *DOMAIN_ENV.values(),
         *DOMAIN_ENV_ALIASES.values(),
@@ -191,6 +195,8 @@ _ENV_KEYS = frozenset(
 )
 
 _ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# HLC-safe sync node id (agents-store _NODE_RE forbids ":" in node ids).
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 # Sentinel for "argument not passed" in update helpers (None means clear).
 _UNSET: Any = object()
@@ -318,9 +324,27 @@ def _read_meta(root: Path) -> dict:
 # sync_hosts entries are peer ids *as the sync hub sees them*: the channel
 # device id the hub minted at pairing (agents-relay ``/v1/hub/devices``).
 # They are NOT Host.host_id() values -- ``default_host`` is the host-picker
-# id; ``sync_hosts`` is the hub fan-out allowlist. Empty = every paired
-# device of the herd.
+# id; ``sync_hosts`` is the hub fan-out allowlist. Empty = CLOSED (zero
+# remote devices permitted); only an explicit device id is allowed.
 _PEER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+
+_SYNC_POLICIES = ("local", "synced", "shared")
+# default_host: host-picker id (klanker#133); strict, never coerced.
+_HOST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# repos[] slugs look like "org/app"; ".." is forbidden (no path escapes).
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_EXEC_KEYS = frozenset({"owner", "failover", "lease_sec"})
+# Read fallback when workspace.json execution is present but unparsable.
+_EXEC_FALLBACK = {"failover": "none", "lease_sec": 45}
+
+
+def _validate_sync_policy(value) -> str:
+    """Strict write-side policy: normalized to local|synced|shared."""
+    policy = str(value or "").strip().lower()
+    if policy not in _SYNC_POLICIES:
+        raise ValueError(
+            f"sync_policy must be local|synced|shared: {value!r}")
+    return policy
 
 
 def _validate_sync_hosts(value) -> list[str]:
@@ -345,17 +369,226 @@ def _validate_sync_hosts(value) -> list[str]:
     return out
 
 
-def _read_sync_hosts(value) -> tuple:
-    """Tolerant read-side parse: a hand-edited bad value never crashes
-    workspace loading; invalid entries are dropped."""
-    if not isinstance(value, (list, tuple)):
+def _validate_default_host(value) -> str:
+    """Strict write-side default_host: host-id string or "" (no coercion)."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"default_host must be a string id, got {type(value).__name__}")
+    clean = value.strip()
+    if not clean:
+        return ""
+    if not _HOST_ID_RE.match(clean):
+        raise ValueError(f"invalid default_host id: {value!r}")
+    return clean
+
+
+def _validate_repo_slug(slug) -> str:
+    clean = str(slug or "").strip()
+    if not clean or ".." in clean or not _REPO_SLUG_RE.match(clean):
+        raise ValueError(f"invalid repo slug: {slug!r}")
+    return clean
+
+
+def _validate_repos(repos) -> tuple:
+    """Strict write-side repos[]: {slug, url, checkout_mode} dicts.
+
+    ``path`` keys are refused outright: checkout paths stay host-local in
+    ``<host>/host_paths.json`` and must never travel in workspace.json.
+    """
+    if repos is None:
         return ()
+    if isinstance(repos, (str, bytes)) or isinstance(repos, Mapping) \
+            or not isinstance(repos, (list, tuple)):
+        raise ValueError(
+            f"repos must be a list of repo mappings, got {type(repos).__name__}")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in repos:
+        if not isinstance(r, Mapping):
+            raise ValueError(f"repos entries must be mappings: {r!r}")
+        if "path" in r:
+            raise ValueError(
+                "repos entries must not carry a host-local 'path' key; "
+                "use host_paths.json")
+        slug = _validate_repo_slug(r.get("slug"))
+        if slug in seen:
+            raise ValueError(f"duplicate repo slug: {slug!r}")
+        seen.add(slug)
+        mode = str(r.get("checkout_mode") or "shared")
+        if mode not in ("shared", "worktree"):
+            raise ValueError(
+                f"checkout_mode must be shared|worktree: {mode!r}")
+        out.append(
+            {"slug": slug,
+             "url": str(r.get("url") or ""),
+             "checkout_mode": mode})
+    return tuple(out)
+
+
+def _validate_execution(value) -> dict:
+    """Strict write-side execution: {owner, failover, lease_sec} only.
+
+    Secret-looking keys are rejected; ``lease_sec`` must be a real int
+    (never bool) inside [15, 3600]; ``owner`` a peer id or "".
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"execution must be a mapping, got {type(value).__name__}")
+    _reject_secret_config_keys(value)
+    unknown = set(str(k) for k in value) - _EXEC_KEYS
+    if unknown:
+        raise ValueError(
+            f"unknown execution keys: {sorted(unknown)} "
+            f"(allowed: {sorted(_EXEC_KEYS)})")
+    out: dict = {}
+    if "owner" in value:
+        owner = value["owner"]
+        if owner is None or (isinstance(owner, str) and not owner.strip()):
+            pass  # empty clears
+        elif isinstance(owner, str) and _PEER_ID_RE.match(owner.strip()):
+            out["owner"] = owner.strip()
+        else:
+            raise ValueError(f"invalid execution.owner peer id: {owner!r}")
+    if "failover" in value:
+        failover = str(value["failover"] or "none")
+        if failover not in ("standby", "none"):
+            raise ValueError(
+                f"execution.failover must be standby|none: {failover!r}")
+        out["failover"] = failover
+    if "lease_sec" in value:
+        lease = value["lease_sec"]
+        if isinstance(lease, bool) or not isinstance(lease, int) \
+                or not (15 <= lease <= 3600):
+            raise ValueError(
+                "execution.lease_sec must be an int in [15, 3600]: "
+                f"{lease!r}")
+        out["lease_sec"] = lease
+    return out
+
+
+def _read_sync_policy(value) -> tuple[str, bool]:
+    """Tolerant read: missing/empty -> ``local``; unknown -> ``local`` +
+    error flag (fail closed, never widen access)."""
+    if value is None:
+        return "local", False
+    if not isinstance(value, str):
+        return "local", True
+    policy = value.strip().lower()
+    if not policy:
+        return "local", False
+    if policy in _SYNC_POLICIES:
+        return policy, False
+    return "local", True
+
+
+def _read_sync_hosts(value) -> tuple[tuple, bool]:
+    """Tolerant read-side parse: a hand-edited bad value never crashes
+    workspace loading AND never widens access -- any malformed shape
+    (non-list, or any invalid peer id) fails closed to ``()`` + error."""
+    if value is None:
+        return (), False
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping) \
+            or not isinstance(value, (list, tuple)):
+        return (), True
     out: list[str] = []
     for item in value:
-        if isinstance(item, str) and _PEER_ID_RE.match(item.strip()) \
-                and item.strip() not in out:
+        if not isinstance(item, str) or not _PEER_ID_RE.match(item.strip()):
+            return (), True
+        if item.strip() not in out:
             out.append(item.strip())
-    return tuple(out)
+    return tuple(out), False
+
+
+def _read_default_host(value) -> tuple[str, bool]:
+    """Tolerant read: only a valid host-id string survives (no coercion)."""
+    if value is None or value == "":
+        return "", False
+    if isinstance(value, str) and _HOST_ID_RE.match(value.strip()):
+        return value.strip(), False
+    return "", True
+
+
+def _read_repos(value) -> tuple[tuple, bool]:
+    """Tolerant read: malformed repos never crash ``host.workspace()``;
+    any invalid entry fails closed to ``()`` + error."""
+    if value is None:
+        return (), False
+    try:
+        return _validate_repos(value), False
+    except ValueError:
+        return (), True
+
+
+def _read_execution(value) -> tuple[dict, bool]:
+    """Tolerant read: malformed values fall back to safe defaults
+    (``failover=none``, ``lease_sec=45``) instead of crashing."""
+    if value is None:
+        return {}, False
+    if not isinstance(value, Mapping):
+        return dict(_EXEC_FALLBACK), True
+    out: dict = {}
+    err = False
+    for key in value:
+        if key not in _EXEC_KEYS:
+            err = True
+    if "owner" in value:
+        owner = value["owner"]
+        if owner is None or (isinstance(owner, str) and not owner.strip()):
+            out["owner"] = ""
+        elif isinstance(owner, str) and _PEER_ID_RE.match(owner.strip()):
+            out["owner"] = owner.strip()
+        else:
+            out["owner"] = ""
+            err = True
+    if "failover" in value:
+        failover = value["failover"]
+        if failover in ("standby", "none"):
+            out["failover"] = failover
+        else:
+            out["failover"] = "none"
+            err = True
+    if "lease_sec" in value:
+        lease = value["lease_sec"]
+        if isinstance(lease, int) and not isinstance(lease, bool) \
+                and 15 <= lease <= 3600:
+            out["lease_sec"] = lease
+        else:
+            out["lease_sec"] = 45
+            err = True
+    return out, err
+
+
+def _ownership_from_meta(meta: Mapping) -> dict:
+    """Parse the 5 ownership fields off ``workspace.json`` (read side).
+
+    Never raises: malformed fields fail closed and set ``_policy_error`` so
+    a hand-edited workspace.json can never silently widen sync access.
+    """
+    policy, perr = _read_sync_policy(meta.get("sync_policy"))
+    hosts, herr = _read_sync_hosts(meta.get("sync_hosts"))
+    dhost, derr = _read_default_host(meta.get("default_host"))
+    repos, rerr = _read_repos(meta.get("repos"))
+    execution, eerr = _read_execution(meta.get("execution"))
+    policy_error = perr or herr or derr or rerr or eerr
+    if policy_error:
+        warnings.warn(
+            "malformed ownership field(s) in workspace.json "
+            f"({meta.get('id') or '?'}); failing closed",
+            UserWarning,
+            stacklevel=3,
+        )
+    return {
+        "sync_policy": policy,
+        "sync_hosts": hosts,
+        "default_host": dhost,
+        "repos": repos,
+        "execution": execution,
+        "_policy_error": policy_error,
+    }
 
 
 @dataclass(frozen=True)
@@ -449,7 +682,7 @@ class Host:
         existing = host_config(self).get("host_id")
         if isinstance(existing, str) and existing.strip():
             return existing.strip()
-        did = _agents_keys_did()
+        did = _agents_keys_did(self)
         if did:
             return did
         host_id = f"host_{uuid.uuid4().hex}"
@@ -457,6 +690,19 @@ class Host:
         data["host_id"] = host_id
         _atomic_json_write(self.agents_json, data)
         return host_id
+
+    def sync_node_id(self) -> str:
+        """HLC-safe node identifier derived from ``host_id()``.
+
+        ``host_<uuid>`` ids pass through unchanged; DID-style ids contain
+        ``:`` which breaks the agents-store ``_NODE_RE``, so they map to a
+        stable ``k_<sha256[:16]>`` token instead.
+        """
+        hid = self.host_id()
+        if _NODE_ID_RE.match(hid):
+            return hid
+        digest = hashlib.sha256(hid.encode("utf-8")).hexdigest()[:16]
+        return f"k_{digest}"
 
     def has_legacy_layout(self) -> bool:
         """Host was never migrated: no workspaces/, legacy domains on top."""
@@ -472,6 +718,57 @@ class Host:
             _deprecated(ENV_USERS_FILE_LEGACY, ENV_USERS_FILE)
             return _path(legacy)
         return self.dir / "users.json"
+
+    # --- host-local repo checkouts (host_paths.json) --------------------
+
+    def read_host_paths(self) -> dict[str, dict[str, str]]:
+        """Read ``<host>/host_paths.json``: ``{ws_id: {slug: path}}``.
+
+        The ``""`` bucket holds checkouts shared across workspaces. Returns
+        only string->string entries; corrupt shapes are dropped.
+        """
+        data = _json_dict(self.host_paths)
+        out: dict[str, dict[str, str]] = {}
+        for ws_id, mapping in data.items():
+            if not isinstance(ws_id, str) or not isinstance(mapping, Mapping):
+                continue
+            inner = {
+                str(slug): str(path)
+                for slug, path in mapping.items()
+                if isinstance(slug, str) and isinstance(path, str)
+                and slug and path
+            }
+            if inner:
+                out[ws_id] = inner
+        return out
+
+    def set_host_repo_path(self, slug: str, path: str, *, ws_id: str = "") -> Path:
+        """Record a host-local checkout path for repo ``slug`` (optionally
+        per workspace) and atomically rewrite ``host_paths.json``."""
+        clean_slug = _validate_repo_slug(slug)
+        clean_ws = (ws_id or "").strip()
+        raw = str(path or "").strip()
+        if not raw or "\x00" in raw:
+            raise ValueError(f"invalid host repo path: {path!r}")
+        data = _json_dict(self.host_paths)
+        bucket = data.get(clean_ws)
+        bucket = dict(bucket) if isinstance(bucket, Mapping) else {}
+        bucket[clean_slug] = raw
+        data[clean_ws] = bucket
+        return _atomic_json_write(self.host_paths, data)
+
+    def resolve_repo_path(
+        self, slug: str, *, ws_id: str = ""
+    ) -> Path | None:
+        """Checkout path for ``slug``: ``ws_id`` bucket wins, ``""`` falls
+        back as the shared default; ``None`` when unmapped."""
+        paths = self.read_host_paths()
+        keys = [ws_id.strip(), ""] if (ws_id or "").strip() else [""]
+        for key in keys:
+            val = paths.get(key, {}).get(slug)
+            if val:
+                return Path(val).expanduser()
+        return None
 
     # --- workspaces ----------------------------------------------------
 
@@ -490,11 +787,7 @@ class Host:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
-            sync_policy=str(meta.get("sync_policy") or "synced"),
-            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
-            default_host=str(meta.get("default_host") or ""),
-            repos=tuple(meta.get("repos") or ()),
-            execution=dict(meta.get("execution") or {}),
+            **_ownership_from_meta(meta),
             source_env=dict(env or {}),
             apply_overrides=False,
         )
@@ -536,10 +829,55 @@ class Host:
         *,
         isolation: str = "",
         image: str = "",
+        sync_policy: str | None = None,
+        sync_hosts: list | tuple | None = None,
+        default_host: str | None = None,
+        repos: list | tuple | None = None,
+        execution: Mapping | None = None,
         env: Mapping[str, str] | None = None,
     ) -> "Workspace":
-        """Create ``<host>/workspaces/<id>`` plus its first persona."""
+        """Create ``<host>/workspaces/<id>`` plus its first persona.
+
+        Ownership fields default fail-closed (``sync_policy="local"``,
+        ``sync_hosts=()``); ``None`` keeps the on-disk value when the
+        workspace already exists. ``local`` + non-empty ``sync_hosts``
+        raises ``ValueError``.
+        """
         base = self.workspace(ws_id, env=env)
+        policy = (
+            base.sync_policy
+            if sync_policy is None
+            else _validate_sync_policy(sync_policy)
+        )
+        hosts = (
+            base.sync_hosts
+            if sync_hosts is None
+            else tuple(_validate_sync_hosts(sync_hosts))
+        )
+        dhost = (
+            base.default_host
+            if default_host is None
+            else _validate_default_host(default_host)
+        )
+        repos_t = base.repos if repos is None else _validate_repos(repos)
+        exec_d = (
+            dict(base.execution)
+            if execution is None
+            else _validate_execution(execution)
+        )
+        if policy == "local" and hosts:
+            raise ValueError(
+                "sync_policy 'local' forbids non-empty sync_hosts; "
+                "set sync_policy='synced' or 'shared' explicitly"
+            )
+        base = replace(
+            base,
+            sync_policy=policy,
+            sync_hosts=hosts,
+            default_host=dhost,
+            repos=repos_t,
+            execution=exec_d,
+        )
         if isolation or image:
             base = replace(base, isolation=isolation, image=image)
         ws = base.init(
@@ -684,11 +1022,7 @@ class Host:
             if sync_policy is None or not str(sync_policy).strip():
                 meta.pop("sync_policy", None)
             else:
-                policy = str(sync_policy).strip()
-                if policy not in ("local", "synced", "shared"):
-                    raise ValueError(
-                        f"sync_policy must be local|synced|shared: {policy!r}")
-                meta["sync_policy"] = policy
+                meta["sync_policy"] = _validate_sync_policy(sync_policy)
         if sync_hosts is not _UNSET:
             clean_hosts = _validate_sync_hosts(sync_hosts)
             if not clean_hosts:
@@ -696,40 +1030,36 @@ class Host:
             else:
                 meta["sync_hosts"] = clean_hosts
         if default_host is not _UNSET:
-            if default_host is None or not str(default_host).strip():
+            clean_dhost = _validate_default_host(default_host)
+            if not clean_dhost:
                 meta.pop("default_host", None)
             else:
-                meta["default_host"] = str(default_host).strip()
+                meta["default_host"] = clean_dhost
         if repos is not _UNSET:
-            if not repos:
+            clean_repos = _validate_repos(repos)
+            if not clean_repos:
                 meta.pop("repos", None)
             else:
-                clean_repos = []
-                for r in repos:
-                    if not isinstance(r, Mapping) or not r.get("slug"):
-                        raise ValueError("repos entries need a 'slug' key")
-                    mode = str(r.get("checkout_mode") or "shared")
-                    if mode not in ("shared", "worktree"):
-                        raise ValueError(
-                            f"checkout_mode must be shared|worktree: {mode!r}")
-                    clean_repos.append(
-                        {"slug": str(r["slug"]),
-                         "url": str(r.get("url") or ""),
-                         "checkout_mode": mode})
-                meta["repos"] = clean_repos
+                meta["repos"] = [dict(r) for r in clean_repos]
         if execution is not _UNSET:
             if not execution:
                 meta.pop("execution", None)
             else:
-                ex = dict(execution)
-                failover = str(ex.get("failover") or "none")
-                if failover not in ("standby", "none"):
-                    raise ValueError(
-                        f"execution.failover must be standby|none: {failover!r}")
-                ex["failover"] = failover
-                if "lease_sec" in ex:
-                    ex["lease_sec"] = max(1, int(ex["lease_sec"]))
-                meta["execution"] = ex
+                clean_exec = _validate_execution(execution)
+                if clean_exec:
+                    meta["execution"] = clean_exec
+                else:
+                    meta.pop("execution", None)
+        # Invariant (fail-closed): policy "local" (the default when the
+        # field is absent) can never coexist with a sync_hosts allowlist.
+        eff_policy = str(meta.get("sync_policy") or "local").strip().lower()
+        if eff_policy not in _SYNC_POLICIES:
+            eff_policy = "local"
+        if eff_policy == "local" and meta.get("sync_hosts"):
+            raise ValueError(
+                "sync_policy 'local' forbids non-empty sync_hosts; "
+                "set sync_policy='synced' or 'shared' explicitly"
+            )
         _atomic_json_write(ws.workspace_file, meta)
         return self.workspace(ws_id, env=env)
 
@@ -787,19 +1117,44 @@ class Workspace:
     parent_workspace: str = ""  # reserved for Track E job workspaces
     isolation: str = ""  # manifest: local | container (runtime.py resolves)
     image: str = ""  # optional container image override
-    # ownership / distribution contract (agents-workspace#43):
-    # local = never emits ops; synced = op-log sync to sync_hosts, the
-    # hub channel device ids (empty = all herd members; NOT host ids --
-    # see _validate_sync_hosts); shared = reserved multi-user.
-    sync_policy: str = "synced"
+    # ownership / distribution contract (agents-workspace#43, #44):
+    # local = never emits ops (fail-closed default); synced = op-log sync
+    # to sync_hosts, the hub channel device ids (empty = CLOSED, zero
+    # remote devices; NOT host ids -- see _validate_sync_hosts); shared =
+    # reserved multi-user.
+    sync_policy: str = "local"
     sync_hosts: tuple = ()
     default_host: str = ""  # host-picker default (klanker#133)
     repos: tuple = ()  # [{slug, url, checkout_mode}] — paths stay host-local
-    execution: Mapping = field(default_factory=dict)  # {failover, lease_sec}
+    execution: Mapping = field(
+        default_factory=dict)  # {owner, failover, lease_sec}
+    _policy_error: bool = field(default=False, repr=False, compare=False)
     source_env: Mapping[str, str] = field(
         default_factory=dict, repr=False, compare=False
     )
     apply_overrides: bool = field(default=False, repr=False, compare=False)
+
+    @property
+    def policy_error(self) -> bool:
+        """True when workspace.json held malformed ownership fields that
+        failed closed on read (see ``_ownership_from_meta``)."""
+        return self._policy_error
+
+    def is_syncable(self) -> bool:
+        """True when this workspace may emit sync ops to remote devices."""
+        return self.sync_policy in ("synced", "shared")
+
+    def allows_device(self, device_id: str) -> bool:
+        """True when ``device_id`` is explicitly on the sync allowlist.
+
+        Fail-closed: a ``local`` policy or an empty/invalid ``device_id``
+        always denies; ``sync_hosts == ()`` permits zero remote devices.
+        """
+        return bool(
+            self.is_syncable()
+            and device_id
+            and device_id in self.sync_hosts
+        )
 
     # --- construction --------------------------------------------------
 
@@ -866,11 +1221,7 @@ class Workspace:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
-            sync_policy=str(meta.get("sync_policy") or "synced"),
-            sync_hosts=_read_sync_hosts(meta.get("sync_hosts")),
-            default_host=str(meta.get("default_host") or ""),
-            repos=tuple(meta.get("repos") or ()),
-            execution=dict(meta.get("execution") or {}),
+            **_ownership_from_meta(meta),
             source_env=dict(env),
             apply_overrides=True,
         )
@@ -907,6 +1258,7 @@ class Workspace:
             parent_workspace=str(meta.get("parent_workspace") or ""),
             isolation=str(meta.get("isolation") or ""),
             image=str(meta.get("image") or ""),
+            **_ownership_from_meta(meta),
             source_env=env,
             apply_overrides=False,
         )
@@ -1199,6 +1551,30 @@ class Workspace:
             meta["isolation"] = self.isolation
         if self.image:
             meta["image"] = self.image
+        # Ownership contract: policy is always written (fail-closed
+        # "local" default); local + allowlist can never be persisted.
+        meta["sync_policy"] = (
+            str(self.sync_policy or "local").strip().lower() or "local"
+        )
+        if meta["sync_policy"] not in _SYNC_POLICIES:
+            meta["sync_policy"] = "local"
+        if meta["sync_policy"] == "local" and self.sync_hosts:
+            raise ValueError(
+                "sync_policy 'local' forbids non-empty sync_hosts; "
+                "set sync_policy='synced' or 'shared' explicitly"
+            )
+        # The workspace object is authoritative for the other four fields:
+        # falsy values clear stale keys instead of silently keeping them.
+        for key, val in (
+            ("sync_hosts", list(self.sync_hosts)),
+            ("default_host", self.default_host),
+            ("repos", [dict(r) for r in self.repos]),
+            ("execution", dict(self.execution)),
+        ):
+            if val:
+                meta[key] = val
+            else:
+                meta.pop(key, None)
         self.workspace_file.write_text(
             json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -1310,7 +1686,7 @@ class Workspace:
         out[ENV_HOST_DIR] = str(self.host.dir)
         out[ENV_WORKSPACE] = self.id
         out[ENV_WORKDIR] = str(workdir_p)
-        if meta.get("workdir_lock") is True and "AGENTS_WORKDIR_LOCK" not in raw_base:
+        if meta.get("workdir_lock") is True and "AGENTS_WORKDIR_LOCK" not in out:
             out["AGENTS_WORKDIR_LOCK"] = "1"
         if persona:
             out["AGENTS_PERSONA"] = persona
@@ -1363,6 +1739,11 @@ class Workspace:
             "label": self.label,
             "default_persona": self.default_persona,
             "parent_workspace": self.parent_workspace,
+            "sync_policy": self.sync_policy,
+            "sync_hosts": list(self.sync_hosts),
+            "default_host": self.default_host,
+            "repos": [dict(r) for r in self.repos],
+            "execution": dict(self.execution),
             "domains": {name: str(self.domain(name)) for name in DIR_DOMAINS},
             "claude": str(self.claude),
             "identity": str(self.identity),
@@ -1391,6 +1772,7 @@ def denied_paths(ws: Workspace, env: Mapping[str, str] | None = None) -> list[Pa
         host.mcp_dir,
         host.agents_json,
         host.users_file(env_map),
+        host.host_paths,
         host.approval_allowlist,
         host.run / "approvals",
         host.logs,
@@ -1510,19 +1892,27 @@ def _atomic_json_write(path: Path, data: Mapping) -> Path:
     return path
 
 
-def _agents_keys_did() -> str:
+def _agents_keys_did(host: Host) -> str:
     """Best-effort DID lookup via the optional ``agents_keys`` CLI.
 
     Delegates any key material handling to ``agents_keys``; this process
-    never reads raw ``.ed25519`` bytes. Returns "" when the package or a
-    host key is unavailable.
+    never reads raw ``.ed25519`` bytes. The child env is pinned to THIS
+    host (``AGENTS_HOST_DIR``/``AGENTS_KEYS_DIR``) so an isolated
+    ``Host(tmp)`` can never leak the real ``~/.agents`` host DID.
+    Returns "" when the package or a host key is unavailable.
     """
+    env = {
+        **os.environ,
+        ENV_HOST_DIR: str(host.dir),
+        "AGENTS_KEYS_DIR": str(host.keys),
+    }
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "agents_keys", "did", "host"],
             capture_output=True,
             text=True,
             timeout=10,
+            env=env,
         )
     except Exception:
         return ""
