@@ -1130,6 +1130,34 @@ class TestWorkspaceSyncPolicy(unittest.TestCase):
             self.assertEqual(ws.repos, ())
             self.assertEqual(ws.execution, {})
 
+    def test_execution_partial_update_merges(self):
+        """ws#45/R02: an execution patch merges — omitted keys keep the
+        stored values instead of being silently erased."""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            host.create("a")
+            host.update_workspace(
+                "a",
+                execution={
+                    "owner": "dev-1",
+                    "failover": "standby",
+                    "lease_sec": 120,
+                },
+            )
+            # failover-only update preserves owner + lease_sec
+            ws = host.update_workspace("a", execution={"failover": "none"})
+            self.assertEqual(ws.execution["owner"], "dev-1")
+            self.assertEqual(ws.execution["failover"], "none")
+            self.assertEqual(ws.execution["lease_sec"], 120)
+            # explicit None clears owner only; other keys survive
+            ws = host.update_workspace("a", execution={"owner": None})
+            self.assertNotIn("owner", ws.execution)
+            self.assertEqual(ws.execution["failover"], "none")
+            self.assertEqual(ws.execution["lease_sec"], 120)
+            # execution=None still clears the whole block
+            ws = host.update_workspace("a", execution=None)
+            self.assertEqual(ws.execution, {})
+
 
 class TestFailClosedPolicyModel(unittest.TestCase):
     """agents-workspace#44: fail-closed sync policy, strict ownership

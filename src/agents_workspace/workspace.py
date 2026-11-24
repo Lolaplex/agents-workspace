@@ -573,7 +573,11 @@ def _ownership_from_meta(meta: Mapping) -> dict:
     dhost, derr = _read_default_host(meta.get("default_host"))
     repos, rerr = _read_repos(meta.get("repos"))
     execution, eerr = _read_execution(meta.get("execution"))
-    policy_error = perr or herr or derr or rerr or eerr
+    # Effective 'local' + non-empty allowlist is a hand-edited contradiction:
+    # it fails closed at runtime but must surface as a policy error.
+    policy_error = perr or herr or derr or rerr or eerr or (
+        policy == "local" and bool(hosts)
+    )
     if policy_error:
         warnings.warn(
             "malformed ownership field(s) in workspace.json "
@@ -694,9 +698,11 @@ class Host:
     def sync_node_id(self) -> str:
         """HLC-safe node identifier derived from ``host_id()``.
 
-        ``host_<uuid>`` ids pass through unchanged; DID-style ids contain
-        ``:`` which breaks the agents-store ``_NODE_RE``, so they map to a
-        stable ``k_<sha256[:16]>`` token instead.
+        Ids matching ``_NODE_ID_RE`` (``^[A-Za-z0-9_-]{1,32}$``) pass
+        through unchanged. Anything else — including ``host_<uuid4hex>``
+        (37 chars, over the 32-char cap) and DID-style ids whose ``:``
+        breaks the agents-store ``_NODE_RE`` — maps to a stable
+        ``k_<sha256[:16]>`` token instead.
         """
         hid = self.host_id()
         if _NODE_ID_RE.match(hid):
@@ -1046,8 +1052,18 @@ class Host:
                 meta.pop("execution", None)
             else:
                 clean_exec = _validate_execution(execution)
-                if clean_exec:
-                    meta["execution"] = clean_exec
+                # Partial update merges into the stored execution: keys the
+                # caller omitted keep their values (an explicit None/""
+                # owner is the only clear).
+                prev_exec = meta.get("execution")
+                merged = (
+                    dict(prev_exec) if isinstance(prev_exec, Mapping) else {}
+                )
+                merged.update(clean_exec)
+                if "owner" in execution and "owner" not in clean_exec:
+                    merged.pop("owner", None)
+                if merged:
+                    meta["execution"] = merged
                 else:
                     meta.pop("execution", None)
         # Invariant (fail-closed): policy "local" (the default when the
@@ -1575,15 +1591,14 @@ class Workspace:
                 meta[key] = val
             else:
                 meta.pop(key, None)
-        self.workspace_file.write_text(
-            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        _atomic_json_write(self.workspace_file, meta)
         return replace(
             self,
             id=meta["id"],
             label=meta["label"],
             default_persona=meta["default_persona"],
             parent_workspace=str(meta.get("parent_workspace") or ""),
+            sync_policy=meta["sync_policy"],
         )
 
     def migrate(self, *, dry_run: bool = False) -> list[tuple[Path, Path]]:
