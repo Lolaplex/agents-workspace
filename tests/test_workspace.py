@@ -178,10 +178,10 @@ class TestDomains(unittest.TestCase):
                     Path(tmp) / "workspaces" / "b" / "memory",
                 )
                 self.assertEqual(
-                    [str(ws.memory) for ws in host.list_workspaces()],
+                    [os.path.normcase(str(ws.memory)) for ws in host.list_workspaces()],
                     [
-                        str(Path(tmp) / "workspaces" / "a" / "memory"),
-                        str(Path(tmp) / "workspaces" / "b" / "memory"),
+                        os.path.normcase(str(Path(tmp) / "workspaces" / "a" / "memory")),
+                        os.path.normcase(str(Path(tmp) / "workspaces" / "b" / "memory")),
                     ],
                 )
                 # open() (deprecated ad-hoc) also ignores process overrides.

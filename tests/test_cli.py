@@ -54,7 +54,9 @@ class TestCli(unittest.TestCase):
             code, out = _run(["list"], env)
             self.assertEqual(code, 0)
             self.assertIn("a", out)
-            self.assertIn(str(ws_dir), out)
+            # CLI prints the canonical on-disk casing; tempfile keeps the
+            # env-var casing (Temp vs TEMP) — same directory on Windows.
+            self.assertIn(os.path.normcase(str(ws_dir)), os.path.normcase(out))
 
     def test_show_and_env(self):
         with tempfile.TemporaryDirectory() as tmp:

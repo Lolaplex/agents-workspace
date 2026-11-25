@@ -1308,7 +1308,16 @@ class Workspace:
         else:
             workdir_p = self.workdir
         out[ENV_HOST_DIR] = str(self.host.dir)
-        out[ENV_WORKSPACE] = self.id
+        if self.dir == self.host.dir:
+            # Legacy host-as-workspace: the id is the host dir name (for
+            # example ".agents"), not a registered workspace. Exporting it
+            # as AGENTS_WORKSPACE makes child processes fail closed in
+            # select_workspace ("unknown workspace id") because no such
+            # workspace exists. Children re-derive the legacy layout from
+            # AGENTS_HOST_DIR alone, as pre-migration processes always did.
+            out.pop(ENV_WORKSPACE, None)
+        else:
+            out[ENV_WORKSPACE] = self.id
         out[ENV_WORKDIR] = str(workdir_p)
         if meta.get("workdir_lock") is True and "AGENTS_WORKDIR_LOCK" not in raw_base:
             out["AGENTS_WORKDIR_LOCK"] = "1"
