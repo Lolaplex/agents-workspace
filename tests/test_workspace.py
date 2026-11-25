@@ -298,6 +298,32 @@ class TestEnv(unittest.TestCase):
             self.assertEqual(env["AGENTS_WORKSPACE"], "a")
             self.assertEqual(env["AGENTS_WORKDIR"], str(ws.workdir))
 
+    def test_env_keeps_workdir_keys_for_same_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            inherited = {
+                "AGENTS_WORKDIR_LOCK": "1",
+                "AGENTS_WORKDIR_ALLOW": "/tmp/ok",
+                "AGENTS_WORKSPACE_ALLOW": "/tmp/old",
+            }
+            for context in ("", "a"):
+                env = ws.env({**inherited, "AGENTS_WORKSPACE": context})
+                for key, value in inherited.items():
+                    self.assertEqual(env[key], value, (context, key))
+
+    def test_env_strips_workdir_keys_for_foreign_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Host.open(tmp).create("a")
+            env = ws.env({
+                "AGENTS_WORKSPACE": "b",
+                "AGENTS_WORKDIR_LOCK": "1",
+                "AGENTS_WORKDIR_ALLOW": "/tmp/ok",
+                "AGENTS_WORKSPACE_ALLOW": "/tmp/old",
+            })
+            self.assertNotIn("AGENTS_WORKDIR_LOCK", env)
+            self.assertNotIn("AGENTS_WORKDIR_ALLOW", env)
+            self.assertNotIn("AGENTS_WORKSPACE_ALLOW", env)
+
     def test_env_strips_removed(self):
         ws = Host.open("/tmp/h").workspace("a")
         env = ws.env({"AGENTS_DIR": "/tmp/x"})

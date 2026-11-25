@@ -1644,8 +1644,17 @@ class Workspace:
             raise ValueError(f"unknown workspace env role: {role!r}")
         raw_base = dict(os.environ if base is None else base)
         out = dict(raw_base)
+        same_workspace = _clean(raw_base, ENV_WORKSPACE) in ("", self.id)
         for key in _ENV_KEYS:
             out.pop(key, None)
+        if same_workspace:
+            for key in (
+                "AGENTS_WORKDIR_LOCK",
+                "AGENTS_WORKDIR_ALLOW",
+                "AGENTS_WORKSPACE_ALLOW",
+            ):
+                if key in raw_base:
+                    out[key] = raw_base[key]
         allow = {str(k).strip() for k in extra_allow if str(k).strip()}
         if role != "default":
             for key in INFRA_SECRET_KEYS:
@@ -1701,7 +1710,7 @@ class Workspace:
         out[ENV_HOST_DIR] = str(self.host.dir)
         out[ENV_WORKSPACE] = self.id
         out[ENV_WORKDIR] = str(workdir_p)
-        if meta.get("workdir_lock") is True and "AGENTS_WORKDIR_LOCK" not in out:
+        if meta.get("workdir_lock") is True:
             out["AGENTS_WORKDIR_LOCK"] = "1"
         if persona:
             out["AGENTS_PERSONA"] = persona
