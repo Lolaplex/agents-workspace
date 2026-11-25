@@ -171,6 +171,17 @@ class TestHostSecretVault(unittest.TestCase):
                 scope="workspace",
                 env={"AGENTS_WORKSPACE": "work"},
             )
+            # auto scope still resolves the ws vault file ...
+            self.assertEqual(
+                resolve_secret(
+                    "OPENAI_API_KEY",
+                    host=host,
+                    env={"AGENTS_WORKSPACE": "work"},
+                ),
+                "sk-explicit-host-ws",
+            )
+            # ... and scope="workspace" roundtrips through the same
+            # host-vault ws-<id>.json write_secret just stored to (R02).
             self.assertEqual(
                 resolve_secret(
                     "OPENAI_API_KEY",
@@ -180,6 +191,263 @@ class TestHostSecretVault(unittest.TestCase):
                 ),
                 "sk-explicit-host-ws",
             )
+            # the vault wins over the legacy <ws>/secrets.json fallback.
+            ws.secrets.write_text(
+                json.dumps({"OPENAI_API_KEY": "sk-ws-local"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_secret(
+                    "OPENAI_API_KEY",
+                    host=host,
+                    scope="workspace",
+                    env={"AGENTS_WORKSPACE": "work"},
+                ),
+                "sk-explicit-host-ws",
+            )
+            # with the vault key deleted, the legacy file is still read.
+            self.assertTrue(
+                delete_secret(
+                    "OPENAI_API_KEY",
+                    host=host,
+                    scope="workspace",
+                    env={"AGENTS_WORKSPACE": "work"},
+                )
+            )
+            self.assertEqual(
+                resolve_secret(
+                    "OPENAI_API_KEY",
+                    host=host,
+                    scope="workspace",
+                    env={"AGENTS_WORKSPACE": "work"},
+                ),
+                "sk-ws-local",
+            )
+
+    def test_concurrent_write_secret_loses_no_keys(self):
+        """Locked RMW (R02): N threads writing host.json drop zero keys."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            threads, keys_per_thread = 8, 6
+            barrier = threading.Barrier(threads)
+
+            def worker(t: int) -> None:
+                barrier.wait()
+                for k in range(keys_per_thread):
+                    write_secret(
+                        f"KEY_T{t}_K{k}", f"v-{t}-{k}", host=host, scope="host"
+                    )
+
+            pool = [
+                threading.Thread(target=worker, args=(t,))
+                for t in range(threads)
+            ]
+            for th in pool:
+                th.start()
+            for th in pool:
+                th.join()
+
+            doc = json.loads(
+                secrets_host_file(host).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(doc), threads * keys_per_thread)
+            for t in range(threads):
+                for k in range(keys_per_thread):
+                    self.assertEqual(doc[f"KEY_T{t}_K{k}"], f"v-{t}-{k}")
+
+
+class TestWorkspaceScopeBoundary(unittest.TestCase):
+    """R02 (fixes agents-workspace#44): scope="workspace" searches ONLY
+    this workspace's own <host>/secrets/ws-<id>.json, then the legacy
+    <ws>/secrets.json — never host.json, another ws-<other>.json,
+    keyring, /run/secrets, or env."""
+
+    def _setup(self, tmp: str):
+        host = Host.open(tmp)
+        ws = host.create("w1")
+        return host, ws
+
+    def test_workspace_scope_reads_own_vault_then_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            write_secret("OPENAI_API_KEY", "host-v", host=host, scope="host")
+            write_secret("OPENAI_API_KEY", "ws-vault", ws=ws, scope="workspace")
+            env = {"OPENAI_API_KEY": "env-v"}
+            # host vault + env exist, yet workspace scope sees only its
+            # own ws-<id>.json — the value write_secret just stored.
+            self.assertEqual(
+                resolve_secret("OPENAI_API_KEY", ws, env=env, scope="workspace"),
+                "ws-vault",
+            )
+            # legacy <ws>/secrets.json is fallback only — vault wins.
+            ws.secrets.write_text(
+                json.dumps({"OPENAI_API_KEY": "ws-local"}), encoding="utf-8"
+            )
+            self.assertEqual(
+                resolve_secret("OPENAI_API_KEY", ws, env=env, scope="workspace"),
+                "ws-vault",
+            )
+            self.assertTrue(
+                delete_secret("OPENAI_API_KEY", ws=ws, scope="workspace")
+            )
+            self.assertEqual(
+                resolve_secret("OPENAI_API_KEY", ws, env=env, scope="workspace"),
+                "ws-local",
+            )
+
+    def test_workspace_scope_isolates_other_workspaces_and_host(self):
+        """Oracle: ws2 can never see ws1's vault; host.json stays out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host.open(tmp)
+            ws1 = host.create("w1")
+            ws2 = host.create("w2")
+            write_secret("TOK", "val", ws=ws1, scope="workspace")
+            write_secret("HOST_ONLY", "hv", host=host, scope="host")
+            self.assertEqual(
+                resolve_secret("TOK", ws=ws1, scope="workspace"), "val"
+            )
+            self.assertEqual(
+                resolve_secret("HOST_ONLY", ws=ws1, scope="workspace"), ""
+            )
+            self.assertEqual(
+                resolve_secret("TOK", ws=ws2, scope="workspace"), ""
+            )
+            self.assertEqual(
+                resolve_secret(
+                    "TOK", ws=ws2, env={"TOK": "env-tok"}, scope="workspace"
+                ),
+                "",
+            )
+
+    def test_workspace_scope_blocks_infra_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            write_secret("RELAY_SECRET", "host-rs", host=host, scope="host")
+            env = {"RELAY_SECRET": "env-rs"}
+            self.assertEqual(
+                resolve_secret("RELAY_SECRET", ws, env=env, scope="workspace"),
+                "",
+            )
+            # oracle: "" even with RELAY_SECRET in host vault AND os.environ
+            with patch.dict(os.environ, {"RELAY_SECRET": "os-env-rs"}):
+                self.assertEqual(
+                    resolve_secret("RELAY_SECRET", ws=ws, scope="workspace"),
+                    "",
+                )
+            # even a planted ws-local INFRA key never resolves
+            ws.secrets.write_text(
+                json.dumps({"RELAY_SECRET": "poison"}), encoding="utf-8"
+            )
+            self.assertEqual(
+                resolve_secret("RELAY_SECRET", ws, env=env, scope="workspace"),
+                "",
+            )
+
+    def test_expand_secrets_workspace_scope_blocks_infra(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            write_secret("RELAY_SECRET", "rs", host=host, scope="host")
+            write_secret("OPENAI_API_KEY", "host-ok", host=host, scope="host")
+            ws.secrets.write_text(
+                json.dumps({"MY_TOKEN": "ws-tok"}), encoding="utf-8"
+            )
+            env = {"RELAY_SECRET": "env-rs", "OPENAI_API_KEY": "env-ok"}
+            out = expand_secrets(
+                {
+                    "infra": "${RELAY_SECRET}",
+                    "wslocal": "${MY_TOKEN}",
+                    "fallback": "${OPENAI_API_KEY:-dflt}",
+                },
+                ws=ws,
+                env=env,
+                trusted=True,
+                scope="workspace",
+            )
+            self.assertEqual(out["infra"], "")
+            self.assertEqual(out["wslocal"], "ws-tok")
+            self.assertEqual(out["fallback"], "dflt")
+            # auto scope still resolves host-level values
+            out2 = expand_secrets(
+                {"infra": "${RELAY_SECRET}"}, ws=ws, env=env, trusted=True
+            )
+            self.assertEqual(out2["infra"], "env-rs")
+            with self.assertRaises(ValueError):
+                expand_secrets("${X}", ws=ws, trusted=True, scope="bogus")
+
+    def test_doctor_flags_secretish_keys_inside_list_items(self):
+        """R02: repos:[{api_key}] nested under a list is still caught."""
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["repos"] = [{"slug": "a", "api_key": "x"}]
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                rep = doctor(host)
+            self.assertEqual(rep["status"], "warn")
+            msgs = " ".join(i["message"] for i in rep["issues"])
+            self.assertIn("repos.api_key", msgs)
+
+    def test_doctor_flags_local_policy_with_sync_hosts_once(self):
+        """R02: hand-edited local+allowlist -> policy_error + one issue."""
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_policy"] = "local"
+            meta["sync_hosts"] = ["dev-1"]
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bad = host.workspace("w1")
+                rep = doctor(host)
+            # runtime still fails closed, but the contradiction surfaces.
+            self.assertFalse(bad.is_syncable())
+            self.assertFalse(bad.allows_device("dev-1"))
+            self.assertTrue(bad.policy_error)
+            self.assertEqual(rep["status"], "warn")
+            msgs = [
+                i["message"]
+                for i in rep["issues"]
+                if i["path"] == str(ws.workspace_file)
+            ]
+            self.assertEqual(len(msgs), 1, msgs)
+            self.assertIn("sync_hosts", msgs[0])
+
+    def test_doctor_flags_malformed_policy_and_secretish_keys(self):
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._setup(tmp)
+            meta = json.loads(ws.workspace_file.read_text(encoding="utf-8"))
+            meta["sync_policy"] = "everything"
+            meta["sync_hosts"] = "my-laptop"
+            meta["MY_API_TOKEN"] = "leak"
+            ws.workspace_file.write_text(json.dumps(meta), encoding="utf-8")
+            ws.config.write_text(
+                json.dumps({"nested": {"MY_SECRET": "x"}}), encoding="utf-8"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                rep = doctor(host)
+            self.assertEqual(rep["status"], "warn")
+            wsj_msgs = [
+                i["message"] for i in rep["issues"]
+                if i["path"] == str(ws.workspace_file)
+            ]
+            self.assertTrue(any("sync_policy" in m for m in wsj_msgs), wsj_msgs)
+            self.assertTrue(any("sync_hosts" in m for m in wsj_msgs), wsj_msgs)
+            self.assertTrue(any("MY_API_TOKEN" in m for m in wsj_msgs), wsj_msgs)
+            cfg_issues = [
+                i for i in rep["issues"] if i["path"] == str(ws.config)
+            ]
+            self.assertTrue(cfg_issues)
+            self.assertIn("MY_SECRET", cfg_issues[0]["message"])
 
 
 class TestResolveRelayToken(unittest.TestCase):

@@ -6,16 +6,25 @@ import json
 import os
 import re
 import secrets as _py_secrets
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 from .workspace import (
     ENV_WORKSPACE,
     INFRA_SECRET_KEYS,
+    LLM_SECRET_KEYS,
     Host,
     Workspace,
     _json_dict,
+    _PEER_ID_RE,
+    _SECRETISH_KEY,
     default_host_dir,
     host_config,
 )
@@ -67,7 +76,7 @@ def _atomic_write_json(path: Path, data: Mapping[str, str]) -> Path:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
-        os.replace(tmp, path)
+        _os_replace_retry(tmp, path)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -79,6 +88,101 @@ def _atomic_write_json(path: Path, data: Mapping[str, str]) -> Path:
             pass
         raise
     return path
+
+
+# --- cross-process vault lock ------------------------------------------------
+# Writers serialize on ``<vault>.lock`` via the OS advisory lock
+# (``msvcrt.locking`` byte-0 on Windows, ``fcntl.flock`` on POSIX) with
+# exponential backoff — klanker Rust ``secrets.rs`` parity: 10s bound, 5ms
+# delay doubling to 200ms. The open handle IS the lock, so a crashed process
+# can never leave a stale lockfile behind.
+_VAULT_LOCK_TIMEOUT_SEC = 10.0
+# Windows readers holding the vault open without delete sharing make the
+# rename raise PermissionError (winerror 5/32); bounded retry outlasts them.
+_REPLACE_RETRY_SEC = 2.0
+
+
+def _os_replace_retry(tmp: Path, path: Path) -> None:
+    """``os.replace`` retried on Windows sharing violations (winerror 5/32)."""
+    deadline = time.monotonic() + _REPLACE_RETRY_SEC
+    delay = 0.005
+    while True:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in (5, 32)
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+
+
+def _try_lock_fd(fd: int) -> None:
+    """Non-blocking OS advisory lock on the vault lockfile handle."""
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_fd(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+class _VaultLock:
+    """Advisory lock on ``<vault>.lock``; use as ``with _VaultLock(path):``."""
+
+    def __init__(self, vault: Path) -> None:
+        self._lock = vault.with_name(vault.name + ".lock")
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_VaultLock":
+        self._lock.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + _VAULT_LOCK_TIMEOUT_SEC
+        delay = 0.005
+        while True:
+            try:
+                fd = os.open(self._lock, os.O_RDWR | os.O_CREAT)
+            except PermissionError as exc:
+                # Windows sharing/lock violation (winerror 5/32/33) -> retry.
+                if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33):
+                    raise
+            else:
+                try:
+                    _try_lock_fd(fd)
+                except OSError as exc:
+                    os.close(fd)
+                    # msvcrt only raises on contention; POSIX: EWOULDBLOCK only.
+                    if os.name != "nt" and not isinstance(exc, BlockingIOError):
+                        raise
+                else:
+                    self._fd = fd
+                    return self
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"vault lock timeout ({self._lock})")
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
+
+    def __exit__(self, *_exc: object) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            _unlock_fd(fd)
+        finally:
+            os.close(fd)
 
 
 def _validate_key(key: str) -> str:
@@ -186,10 +290,30 @@ def resolve_secret(
     ``ws-<id>.json > legacy <ws>/secrets.json > keyring > host.json > ENV``,
     flipped to ``ENV > /run/secrets > ws-<id>.json > ...`` when
     ``AGENTS_SECRETS_ORDER=env-first``.
+
+    ``scope="workspace"`` is a hard boundary: it searches ONLY the target
+    workspace's own vault ``<host>/secrets/ws-<id>.json`` first, then the
+    legacy ``<ws>/secrets.json`` — never ``host.json``, another
+    workspace's ``ws-<other>.json``, the legacy ``<host>/secrets.json``,
+    the OS keyring, ``/run/secrets``, or process env — and never resolves
+    ``INFRA_SECRET_KEYS``.
     """
     if scope not in _SCOPES:
         raise ValueError(f"invalid secret scope: {scope!r}")
     env_map = os.environ if env is None else env
+    if scope == "workspace":
+        if key in INFRA_SECRET_KEYS:
+            return ""
+        _, target_ws = _resolve_target(
+            ws=ws, host=host, env=env_map, need_ws=True
+        )
+        if target_ws is None:
+            return ""
+        for path in (secrets_ws_file(target_ws), target_ws.secrets):
+            val = _read_key_from_json(path, key)
+            if val:
+                return val
+        return ""
     infra_only = scope == "host" or key in INFRA_SECRET_KEYS
     target_host, target_ws = _resolve_target(
         ws=ws, host=host, env=env_map, need_ws=not infra_only
@@ -307,11 +431,14 @@ def write_secret(
     if scope == "workspace" and clean_key in INFRA_SECRET_KEYS:
         raise ValueError(f"infra secret {clean_key!r} must be stored in host scope")
     path = _target_vault_file(scope=scope, host=host, ws=ws, env=env)
-    existing = {
-        k: v for k, v in _json_dict(path).items() if isinstance(v, str) and v
-    }
-    existing[clean_key] = value
-    return _atomic_write_json(path, existing)
+    # Whole read-merge-write under the advisory lock — concurrent writers
+    # (this process, the Rust desktop vault) must not clobber keys.
+    with _VaultLock(path):
+        existing = {
+            k: v for k, v in _json_dict(path).items() if isinstance(v, str) and v
+        }
+        existing[clean_key] = value
+        return _atomic_write_json(path, existing)
 
 
 def delete_secret(
@@ -327,14 +454,15 @@ def delete_secret(
     path = _target_vault_file(scope=scope, host=host, ws=ws, env=env)
     if not path.is_file():
         return False
-    existing = {
-        k: v for k, v in _json_dict(path).items() if isinstance(v, str) and v
-    }
-    if clean_key not in existing:
-        return False
-    del existing[clean_key]
-    _atomic_write_json(path, existing)
-    return True
+    with _VaultLock(path):
+        existing = {
+            k: v for k, v in _json_dict(path).items() if isinstance(v, str) and v
+        }
+        if clean_key not in existing:
+            return False
+        del existing[clean_key]
+        _atomic_write_json(path, existing)
+        return True
 
 
 def secret_inventory(
@@ -393,29 +521,41 @@ def expand_secrets(
     host: Host | None = None,
     env: Mapping[str, str] | None = None,
     trusted: bool = False,
+    scope: str = "auto",
 ) -> Any:
     """Recursively expand ``${VAR}`` / ``${VAR:-default}`` ONLY when ``trusted=True``.
 
     Untrusted inputs (such as workspace-local ``mcp.json``) are returned untouched.
+    ``scope`` is forwarded to ``resolve_secret``; expanding workspace
+    manifests (``scope="workspace"``) never expands ``INFRA_SECRET_KEYS``
+    (RELAY_SECRET, TELEGRAM_BOT_TOKEN, ...).
     """
     if not trusted:
         return obj
+    if scope not in _SCOPES:
+        raise ValueError(f"invalid secret scope: {scope!r}")
+
+    def _resolve_var(var: str) -> str:
+        if scope == "workspace" and var in INFRA_SECRET_KEYS:
+            return ""
+        return resolve_secret(var, ws=ws, host=host, env=env, scope=scope)
+
     if isinstance(obj, str):
         def _sub(match: re.Match[str]) -> str:
             var, default = match.group(1), match.group(2)
-            val = resolve_secret(var, ws=ws, host=host, env=env)
+            val = _resolve_var(var)
             if val:
                 return val
             return default if default is not None else ""
 
         return _EXPAND_RE.sub(_sub, obj)
     if isinstance(obj, list):
-        return [expand_secrets(item, ws=ws, host=host, env=env, trusted=True) for item in obj]
+        return [expand_secrets(item, ws=ws, host=host, env=env, trusted=True, scope=scope) for item in obj]
     if isinstance(obj, tuple):
-        return tuple(expand_secrets(item, ws=ws, host=host, env=env, trusted=True) for item in obj)
+        return tuple(expand_secrets(item, ws=ws, host=host, env=env, trusted=True, scope=scope) for item in obj)
     if isinstance(obj, dict):
         return {
-            str(k): expand_secrets(v, ws=ws, host=host, env=env, trusted=True)
+            str(k): expand_secrets(v, ws=ws, host=host, env=env, trusted=True, scope=scope)
             for k, v in obj.items()
         }
     return obj
@@ -550,6 +690,98 @@ def _eval_doctor_check(
         _add_issue(issues, severity, path, message)
 
 
+def _secretish_keys_in(node: Any, trail: str = "") -> list[str]:
+    """Dotted names of secret-looking keys inside a parsed JSON doc."""
+    out: list[str] = []
+    if isinstance(node, Mapping):
+        for key, val in node.items():
+            name = str(key)
+            if (
+                name in INFRA_SECRET_KEYS
+                or name in LLM_SECRET_KEYS
+                or _SECRETISH_KEY.search(name)
+            ):
+                out.append(trail + name)
+            out.extend(_secretish_keys_in(val, trail + name + "."))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            out.extend(_secretish_keys_in(item, trail))
+    return out
+
+
+def _audit_ws_meta(issues: list[dict[str, str]], ws: Workspace) -> None:
+    """Flag malformed ownership fields and leaked secret-like keys inside
+    ``<ws>/workspace.json`` and ``<ws>/config.json``."""
+    meta_path = ws.workspace_file
+    if meta_path.is_file():
+        meta = _json_dict(meta_path)
+        flagged = False
+        raw_policy = meta.get("sync_policy")
+        if raw_policy is not None and (
+            not isinstance(raw_policy, str)
+            or raw_policy.strip().lower() not in ("local", "synced", "shared", "")
+        ):
+            _add_issue(
+                issues,
+                "medium",
+                meta_path,
+                f"malformed sync_policy in workspace.json: {raw_policy!r}",
+            )
+            flagged = True
+        raw_hosts = meta.get("sync_hosts")
+        hosts_ok = False
+        if raw_hosts is not None:
+            bad_hosts = not isinstance(raw_hosts, list) or any(
+                not isinstance(item, str)
+                or not _PEER_ID_RE.match(item.strip())
+                for item in raw_hosts
+            )
+            if bad_hosts:
+                _add_issue(
+                    issues,
+                    "medium",
+                    meta_path,
+                    "malformed sync_hosts in workspace.json "
+                    "(fails closed to no remote devices)",
+                )
+                flagged = True
+            else:
+                hosts_ok = bool(raw_hosts)
+        eff_local = raw_policy is None or (
+            isinstance(raw_policy, str)
+            and raw_policy.strip().lower() in ("local", "")
+        )
+        if eff_local and hosts_ok:
+            _add_issue(
+                issues,
+                "medium",
+                meta_path,
+                "sync_policy 'local' with non-empty sync_hosts "
+                "(fails closed to no remote devices)",
+            )
+            flagged = True
+        if ws.policy_error and not flagged:
+            _add_issue(
+                issues,
+                "medium",
+                meta_path,
+                "malformed ownership field(s) in workspace.json; "
+                "workspace fails closed",
+            )
+    for path in (meta_path, ws.config):
+        if not path.is_file():
+            continue
+        hits = _secretish_keys_in(_json_dict(path))
+        if hits:
+            _add_issue(
+                issues,
+                "high",
+                path,
+                f"secret-like keys in {path.name}: "
+                + ", ".join(sorted(hits)[:5]),
+            )
+
+
 def doctor(
     host: Host | None = None, *, env: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -601,6 +833,7 @@ def doctor(
             )
 
     for ws in workspaces:
+        _audit_ws_meta(issues, ws)
         if ws.secrets.is_file() and _json_dict(ws.secrets):
             _add_issue(
                 issues,
