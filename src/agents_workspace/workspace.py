@@ -22,6 +22,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import shutil
 import sys
@@ -301,6 +302,17 @@ def _warn_domain_overrides(
             UserWarning,
             stacklevel=3,
         )
+
+
+def _sanitize_host_label(raw: str) -> str:
+    """Strip control chars, normalize whitespace runs to a single space, cap at 64 chars."""
+    cleaned = "".join(
+        " " if ch in ("\t", "\n", "\r") else ch
+        for ch in raw
+        if ord(ch) >= 32 and ord(ch) != 127 or ch in ("\t", "\n", "\r")
+    )
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned[:64]
 
 
 def host_config(
@@ -694,6 +706,38 @@ class Host:
         data["host_id"] = host_id
         _atomic_json_write(self.agents_json, data)
         return host_id
+
+    def host_label(self) -> str:
+        """Human-friendly display label for this host.
+
+        Order: ``agents.json["host_label"]`` > OS hostname
+        (``socket.gethostname()``, ignoring loopback names) > ``"this-host"``.
+        Never returns a raw ``host_<uuid>`` string.
+        """
+        raw = host_config(self).get("host_label")
+        if isinstance(raw, str):
+            clean = _sanitize_host_label(raw)
+            if clean:
+                return clean
+        try:
+            hn = _sanitize_host_label(socket.gethostname())
+        except Exception:
+            hn = ""
+        if hn and hn.lower() not in ("localhost", "127.0.0.1", "::1"):
+            return hn
+        return "this-host"
+
+    def set_host_label(self, label: str) -> str:
+        """Persist a sanitized friendly label in ``agents.json["host_label"]``."""
+        if not isinstance(label, str):
+            raise ValueError("host_label must be a string")
+        clean = _sanitize_host_label(label)
+        if not clean:
+            raise ValueError("host_label must be non-empty")
+        data = host_config(self)
+        data["host_label"] = clean
+        _atomic_json_write(self.agents_json, data)
+        return clean
 
     def sync_node_id(self) -> str:
         """HLC-safe node identifier derived from ``host_id()``.
